@@ -1,0 +1,4 @@
+
+fawbot_31,fawbot_31.local,8888,60,20,90
+fawbot_22,fawbot_22.local,8888,0,20,90
+fawbot_23,fawbot_23.local,8888,30,20,90
