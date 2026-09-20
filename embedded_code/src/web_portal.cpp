@@ -121,7 +121,7 @@ void startWebPortal() {
     WiFi.mode(WIFI_STA);
     WiFi.begin("saraths_Lab", "@Sarath123");
 
-    Serial.print("Connecting to WiFi 'Kerala vision'");
+    Serial.print("Connecting to WiFi 'saraths_Lab'");
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
         Serial.print(".");

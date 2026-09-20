@@ -2,19 +2,12 @@
 """
 FawBot Multi-Robot Fleet Overhead Controller (IDs: 22, 23, 31)
 ==============================================================
-Tracks multiple FawBots simultaneously via an overhead camera, allows clicking
-arbitrary target points on the camera feed, and upon pressing SPACEBAR, executes
-an optimal nearest-neighbor routing algorithm to assign and drive each robot
-along its nearest route concurrently.
-
-UI & Detection Enhancements:
-  - Robust macOS AVFoundation camera auto-enumeration & fallback handling
-  - CLAHE contrast enhancement for low-light tracking
-  - Frame border padding for reliable edge-of-frame detection
-  - True borderless FULLSCREEN mode without empty black bars or window margins
-  - Decoupled raw video tracking from display frame stretching to prevent coordinate drift
-  - 100% Transparent text overlays (no dark background box)
-  - Reduced text size for minimal visual clutter
+Features:
+  - Dynamically records Home Position and Heading Angle upon startup.
+  - Interactive target point assignment via Mouse Clicks.
+  - Multi-agent route calculation upon pressing [SPACEBAR].
+  - Automated "Return to Home" routing upon pressing 'H' or 'h'.
+  - Full-screen support, mDNS resolution, collision avoidance, and CLAHE contrast enhancement.
 """
 
 import cv2
@@ -75,7 +68,7 @@ ALIGN_ENTER_DEG = 22.0
 ALIGN_EXIT_DEG = 12.0
 CMD_SEND_INTERVAL_SEC = 0.06
 COLLISION_RADIUS_PX = 75
-BORDER_PAD = 20  # Pixels padded around frame for edge detection
+BORDER_PAD = 20
 
 SUPPORTED_DICTS = {
     "DICT_ARUCO_ORIGINAL": aruco.DICT_ARUCO_ORIGINAL,
@@ -87,7 +80,7 @@ SUPPORTED_DICTS = {
 
 
 def draw_outlined_text(img, text, pos, scale=0.40, color=(255, 255, 255), thickness=1):
-    """Draws smaller text with a black stroke outline over transparent camera feed."""
+    """Draws small text with a black stroke outline for high readability."""
     x, y = pos
     cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
     cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
@@ -102,6 +95,7 @@ class RobotAgent:
         self.color = cfg["color"]
         self.name = cfg["name"]
 
+        # Current State
         self.pos = None
         self.angle = None
         self.corners = None
@@ -109,6 +103,11 @@ class RobotAgent:
         self.last_seen_time = 0.0
         self.history_trail = deque(maxlen=40)
 
+        # Recorded Home Pose (Captured at Startup)
+        self.home_pos = None      # (x, y)
+        self.home_angle = None    # theta in degrees
+
+        # Control & Route logic
         self.route = []
         self.is_navigating = False
         self.turning = False
@@ -117,6 +116,7 @@ class RobotAgent:
         self.motion_cmd = "S"
         self.status_msg = "IDLE"
 
+        # Network
         self.ip = self.fallback_ip
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setblocking(False)
@@ -177,6 +177,12 @@ class RobotAgent:
         self.last_seen_time = time.time()
         self.history_trail.append(self.pos)
 
+        # Record Initial Pose as Home Position
+        if self.home_pos is None:
+            self.home_pos = (int(self.pos[0]), int(self.pos[1]))
+            self.home_angle = self.angle
+            print(f"[Home Recorded] Bot {self.id} -> Pos: {self.home_pos}, Heading: {self.home_angle:.1f}°")
+
     def mark_lost(self):
         self.visible = False
         self.pos = None
@@ -196,11 +202,11 @@ class MultiRobotFleetController:
         self.raw_w = 1280
         self.raw_h = 720
 
-        # macOS Robust AVFoundation Video Capture Probe
+        # Camera Probe Logic
         self.cap = None
         search_indices = [cam_idx, 0, 1, 2] if cam_idx not in [0, 1, 2] else [cam_idx, 0, 1, 2]
         seen_indices = []
-        
+
         for idx in search_indices:
             if idx in seen_indices:
                 continue
@@ -220,27 +226,24 @@ class MultiRobotFleetController:
 
         if self.cap is None:
             print("[Error] Failed to open any camera device (checked indices 0, 1, 2).")
-            print("[Fix] Ensure camera permissions are granted to Terminal/VSCode in macOS System Settings.")
             sys.exit(1)
 
         self.dict_names = list(SUPPORTED_DICTS.keys())
         self.active_dict_idx = 0
         self.detectors = {}
-        
-        # Initialize CLAHE for low-light contrast enhancement
         self.clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         self._init_detectors()
 
         self.unassigned_points = []
         self.fleet_active = False
-        self.banner_text = "CLICK TO ADD GOAL POINTS -> PRESS SPACEBAR TO RUN"
+        self.banner_text = "CLICK TO ADD GOALS -> SPACE: RUN | H: RETURN TO HOME"
         self.banner_color = (0, 255, 255)
 
         self._running = True
         self._mdns_thread = threading.Thread(target=self._background_mdns_resolver, daemon=True)
         self._mdns_thread.start()
 
-        self.window_name = "FawBot Multi-Robot Fleet Navigation (IDs: 22, 23, 31)"
+        self.window_name = "FawBot Multi-Robot Fleet Overhead Controller"
         self.is_fullscreen = fullscreen
 
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
@@ -252,17 +255,11 @@ class MultiRobotFleetController:
     def _init_detectors(self):
         params = aruco.DetectorParameters()
         params.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
-
-        # Allow small / distant marker detection
         params.minMarkerPerimeterRate = 0.01
-
-        # Low light threshold parameters
         params.adaptiveThreshWinSizeMin = 3
         params.adaptiveThreshWinSizeMax = 45
         params.adaptiveThreshWinSizeStep = 5
         params.adaptiveThreshConstant = 7
-
-        # Frame boundary edge detection parameters
         params.minDistanceToBorder = 0
         params.perspectiveRemoveIgnoredMarginPerCell = 0.05
 
@@ -286,21 +283,20 @@ class MultiRobotFleetController:
                 time.sleep(0.5)
 
     def _on_mouse(self, event, x, y, flags, param):
-        # Scale window display click coordinates back to raw unscaled camera coordinates
         raw_x = int(x * (self.raw_w / float(self.target_w)))
         raw_y = int(y * (self.raw_h / float(self.target_h)))
 
         if event == cv2.EVENT_LBUTTONDOWN:
             self.unassigned_points.append((raw_x, raw_y))
             if not self.fleet_active:
-                self.banner_text = f"{len(self.unassigned_points)} POINT(S) ADDED. PRESS SPACEBAR TO EXECUTE"
+                self.banner_text = f"{len(self.unassigned_points)} POINT(S) ADDED. PRESS SPACE TO EXECUTE"
                 self.banner_color = (0, 255, 255)
 
         elif event == cv2.EVENT_RBUTTONDOWN:
             if self.unassigned_points:
                 self.unassigned_points.pop()
                 count = len(self.unassigned_points)
-                self.banner_text = f"{count} POINT(S) REMAINING. PRESS SPACE TO RUN" if count > 0 else "CLICK TO ADD GOAL POINTS"
+                self.banner_text = f"{count} POINT(S) REMAINING. PRESS SPACE TO RUN" if count > 0 else "CLICK TO ADD GOALS"
 
     def toggle_fullscreen(self):
         self.is_fullscreen = not self.is_fullscreen
@@ -311,7 +307,6 @@ class MultiRobotFleetController:
         self.active_dict_idx = (self.active_dict_idx + 1) % len(self.dict_names)
 
     def detect_all_robots(self, frame):
-        """Robust ArUco marker detection enhanced for edge conditions and low light."""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         enhanced_gray = self.clahe.apply(gray)
 
@@ -330,12 +325,10 @@ class MultiRobotFleetController:
                 if rid in flat_ids:
                     idx = np.where(flat_ids == rid)[0][0]
                     c = corners[idx][0].copy()
-                    
                     c[:, 0] -= BORDER_PAD
                     c[:, 1] -= BORDER_PAD
                     
                     center = np.mean(c, axis=0)
-
                     front = (c[0] + c[1]) / 2.0
                     back = (c[2] + c[3]) / 2.0
                     heading_deg = math.degrees(math.atan2(front[1] - back[1], front[0] - back[0]))
@@ -348,6 +341,7 @@ class MultiRobotFleetController:
                 robot.mark_lost()
 
     def optimize_and_assign_routes(self):
+        """Assigns user target points dynamically using Hungarian/Nearest-Neighbor assignment."""
         if not self.unassigned_points:
             self.banner_text = "NO POINTS TO ASSIGN! CLICK ON CAMERA VIEW FIRST."
             self.banner_color = (0, 0, 255)
@@ -421,6 +415,29 @@ class MultiRobotFleetController:
         self.banner_text = "FLEET EXECUTING NEAREST ROUTES..."
         self.banner_color = (0, 255, 0)
 
+    def return_to_home(self):
+        """Directs each robot back to its recorded initial home position."""
+        self.unassigned_points = []
+        returning_count = 0
+
+        for robot in self.robots.values():
+            if robot.home_pos is not None:
+                robot.route = [robot.home_pos]
+                robot.is_navigating = True
+                robot.turning = False
+                robot.status_msg = "RETURNING HOME"
+                returning_count += 1
+            else:
+                robot.status_msg = "HOME POSE NOT RECORDED"
+
+        if returning_count > 0:
+            self.fleet_active = True
+            self.banner_text = f"RETURNING {returning_count} ROBOT(S) TO RECORDED HOME POSITIONS..."
+            self.banner_color = (255, 165, 0)
+        else:
+            self.banner_text = "CANNOT RETURN HOME: NO HOME POSITIONS STORED!"
+            self.banner_color = (0, 0, 255)
+
     def check_collision_avoidance(self):
         active_robots = [r for r in self.robots.values() if r.is_navigating and r.pos is not None]
 
@@ -474,7 +491,7 @@ class MultiRobotFleetController:
                     robot.is_navigating = False
                     robot.motion_cmd = "S"
                     robot.send("S", force=True)
-                    robot.status_msg = "COMPLETED"
+                    robot.status_msg = "HOME ARRIVED" if target_pt == robot.home_pos else "COMPLETED"
                 else:
                     robot.status_msg = f"NEXT GOAL ({len(robot.route)} LEFT)"
                 continue
@@ -496,7 +513,7 @@ class MultiRobotFleetController:
             if robot.turning:
                 robot.motion_cmd = robot.turn_dir
                 robot.send(robot.motion_cmd)
-                robot.status_msg = f"ROTATING {'R' if robot.turn_dir == 'R' else 'L'} ({error_angle:+.0f} deg)"
+                robot.status_msg = f"ROTATING {'R' if robot.turn_dir == 'R' else 'L'} ({error_angle:+.0f}°)"
             else:
                 robot.motion_cmd = "F"
                 robot.send("F")
@@ -504,7 +521,7 @@ class MultiRobotFleetController:
 
         if all_completed and self.fleet_active:
             self.fleet_active = False
-            self.banner_text = "FLEET MISSION COMPLETE! ALL ROBOTS ARRIVED."
+            self.banner_text = "FLEET MISSION COMPLETE! ALL ROBOTS AT DESTINATIONS."
             self.banner_color = (0, 255, 0)
 
     def emergency_stop_all(self):
@@ -529,6 +546,14 @@ class MultiRobotFleetController:
         self.banner_color = (255, 255, 255)
 
     def draw_hud(self, frame):
+        # Draw Home Position Indicators
+        for robot in self.robots.values():
+            if robot.home_pos is not None:
+                hx, hy = robot.home_pos
+                cv2.rectangle(frame, (hx - 12, hy - 12), (hx + 12, hy + 12), robot.color, 1)
+                cv2.circle(frame, (hx, hy), 3, robot.color, -1)
+                draw_outlined_text(frame, f"H{robot.id}", (hx + 14, hy + 4), scale=0.38, color=robot.color)
+
         # Breadcrumbs
         for robot in self.robots.values():
             pts = list(robot.history_trail)
@@ -560,10 +585,10 @@ class MultiRobotFleetController:
                     cv2.circle(frame, pt, ARRIVAL_THRESHOLD_PX, robot.color, 2 if is_active else 1, cv2.LINE_AA)
                     cv2.circle(frame, pt, 5, (0, 0, 0), -1)
                     cv2.circle(frame, pt, 3, robot.color, -1)
-                    label = f"R{robot.id} (#{idx+1})"
+                    label = f"R{robot.id} (Home)" if pt == robot.home_pos else f"R{robot.id} (#{idx+1})"
                     draw_outlined_text(frame, label, (pt[0] + 8, pt[1] - 8), scale=0.40, color=robot.color, thickness=1)
 
-        # Robot Marker & Tag Overlays
+        # Robot Tag Overlays
         for robot in self.robots.values():
             if robot.visible and robot.pos is not None:
                 rx, ry = int(robot.pos[0]), int(robot.pos[1])
@@ -587,7 +612,7 @@ class MultiRobotFleetController:
 
                 draw_outlined_text(frame, tag, (rx - 20, ry - 12), scale=0.42, color=robot.color, thickness=1)
 
-        # Top Fleet Status Text
+        # Status Overlay
         draw_outlined_text(frame, self.banner_text, (15, 25), scale=0.45, color=self.banner_color, thickness=1)
 
         y_offset = 45
@@ -595,13 +620,14 @@ class MultiRobotFleetController:
             status_color = robot.color if robot.visible else (160, 160, 160)
             vis_str = "VIS" if robot.visible else "LOST"
             route_str = f"Route: {len(robot.route)} pts" if robot.route else "No Route"
-            row_text = f"[{vis_str}] Bot {rid} ({robot.name}) | {robot.ip} | {route_str} | {robot.status_msg}"
+            home_str = f"Home: ({robot.home_pos[0]},{robot.home_pos[1]})" if robot.home_pos else "Home: N/A"
+            row_text = f"[{vis_str}] Bot {rid} | {home_str} | {route_str} | {robot.status_msg}"
             draw_outlined_text(frame, row_text, (15, y_offset), scale=0.38, color=status_color, thickness=1)
             y_offset += 18
 
-        # Bottom Instructions Text
+        # Legend Overlay
         h, w = frame.shape[:2]
-        legend_str = "[Left Click]: Add Point  |  [Right Click]: Undo  |  [SPACEBAR]: Assign & START  |  [S]: STOP  |  [C]: Clear  |  [F]: Fullscreen  |  [Q/Esc]: Quit"
+        legend_str = "[Left Click]: Add Goal | [SPACEBAR]: Start Fleet | [H]: Return Home | [S]: STOP | [C]: Clear | [F]: Fullscreen | [Q]: Quit"
         draw_outlined_text(frame, legend_str, (15, h - 15), scale=0.38, color=(240, 240, 240), thickness=1)
 
     def run(self):
@@ -615,23 +641,22 @@ class MultiRobotFleetController:
                 for robot in self.robots.values():
                     robot.poll_feedback()
 
-                # Process computer vision and path logic on native raw coordinates
                 self.detect_all_robots(raw_frame)
                 self.check_collision_avoidance()
                 self.update_fleet_navigation()
                 self.draw_hud(raw_frame)
 
-                # Resize raw image to match target screen dimensions to eliminate black bars/empty space
                 display_frame = cv2.resize(raw_frame, (self.target_w, self.target_h), interpolation=cv2.INTER_LINEAR)
-
                 cv2.imshow(self.window_name, display_frame)
 
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord('q'), 27):
                     self.emergency_stop_all()
                     break
-                elif key == 32:
+                elif key == 32:  # SPACE BAR
                     self.optimize_and_assign_routes()
+                elif key in (ord('h'), ord('H')):  # Key 'H' or 'h'
+                    self.return_to_home()
                 elif key in (ord('s'), ord('S')):
                     self.emergency_stop_all()
                 elif key in (ord('c'), ord('C')):
@@ -652,7 +677,7 @@ class MultiRobotFleetController:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="FawBot Multi-Robot Fleet Controller")
+    parser = argparse.ArgumentParser(description="FawBot Multi-Robot Fleet Overhead Controller")
     parser.add_argument("--camera", type=int, default=0, help="Camera device index")
     parser.add_argument("--windowed", action="store_true", help="Launch in windowed mode")
     parser.add_argument("--ip22", type=str, default=FLEET_CONFIG[22]["fallback_ip"])
