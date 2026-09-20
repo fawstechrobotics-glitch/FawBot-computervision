@@ -12,24 +12,34 @@ import sys
 import os
 import json
 import webbrowser
-from PyQt6.QtWidgets import (
+from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QLabel, QComboBox, QPushButton, QTextEdit, QGroupBox, QTabWidget,
     QLineEdit, QSizePolicy
 )
-from PyQt6.QtCore import QProcess, Qt, QUrl
-from PyQt6.QtGui import QFont, QTextCursor
-
-try:
-    from PyQt6.QtWebEngineWidgets import QWebEngineView
-    from PyQt6.QtWebEngineCore import QWebEngineSettings
-    WEBENGINE_AVAILABLE = True
-except ImportError:
-    WEBENGINE_AVAILABLE = False
+from PyQt5.QtCore import QProcess, Qt, QUrl
+from PyQt5.QtGui import QFont, QTextCursor
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "saved_robots.json")
+FAWBOT_OS_DIR = os.path.join(BASE_DIR, "FawBot_OS")
+if FAWBOT_OS_DIR not in sys.path:
+    sys.path.insert(0, FAWBOT_OS_DIR)
 
+try:
+    from ui.main_window import MainWindow as FawBotOSWindow
+    FAWBOT_OS_AVAILABLE = True
+except Exception as exc:
+    FawBotOSWindow = None
+    FAWBOT_OS_AVAILABLE = False
+    FAWBOT_OS_IMPORT_ERROR = exc
+
+try:
+    from PyQt5.QtWebEngineWidgets import QWebEngineView
+    from PyQt5.QtWebEngineWidgets import QWebEngineSettings
+    WEBENGINE_AVAILABLE = True
+except ImportError:
+    WEBENGINE_AVAILABLE = False
 
 def scan_available_scripts():
     """Scans the directory for runnable .py scripts."""
@@ -106,6 +116,9 @@ class FawBotLauncher(QMainWindow):
         self.build_web_tab()
         self.tabs.addTab(self.web_tab, "Robot Web Interface")
 
+        # Tab 3: FawBot OS application
+        self.build_fawbot_os_tab()
+
     def build_script_tab(self):
         layout = QVBoxLayout(self.script_tab)
 
@@ -113,7 +126,7 @@ class FawBotLauncher(QMainWindow):
         title_font = QFont("Arial", 14)
         title_font.setBold(True)
         title_label.setFont(title_font)
-        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(title_label)
 
         selection_group = QGroupBox("Mode Selection")
@@ -215,22 +228,42 @@ class FawBotLauncher(QMainWindow):
         # Web View Engine expanded to maximum stretch
         if WEBENGINE_AVAILABLE:
             self.web_view = QWebEngineView()
-            self.web_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            self.web_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             
             # Web engine setting adjustments for full-page fit
             settings = self.web_view.settings()
-            settings.setAttribute(QWebEngineSettings.WebAttribute.ShowScrollBars, True)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+            settings.setAttribute(QWebEngineSettings.ShowScrollBars, True)
+            settings.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
             
             layout.addWidget(self.web_view, stretch=1)
         else:
             fallback_label = QLabel(
-                "PyQt6-WebEngine is not installed.\n"
-                "Install it using: pip install PyQt6-WebEngine"
+                "PyQt5-WebEngine is not installed.\n"
+                "Install it using: pip install PyQt5 PyQtWebEngine"
             )
-            fallback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            fallback_label.setAlignment(Qt.AlignCenter)
             fallback_label.setStyleSheet("color: #d32f2f; font-size: 14px; font-weight: bold;")
             layout.addWidget(fallback_label, stretch=1)
+
+    def build_fawbot_os_tab(self):
+        """Add the FawBot OS interface as an embedded launcher page."""
+        if FAWBOT_OS_AVAILABLE:
+            self.fawbot_os_window = FawBotOSWindow()
+            self.tabs.addTab(self.fawbot_os_window, "FawBot OS")
+            return
+
+        self.fawbot_os_window = None
+        unavailable_page = QWidget()
+        layout = QVBoxLayout(unavailable_page)
+        message = QLabel(
+            "FawBot OS could not be loaded.\n"
+            f"{FAWBOT_OS_IMPORT_ERROR}\n\n"
+            "Install dependencies from FawBot_OS/requirements.txt."
+        )
+        message.setAlignment(Qt.AlignCenter)
+        message.setStyleSheet("color: #d32f2f; font-size: 14px; font-weight: bold;")
+        layout.addWidget(message)
+        self.tabs.addTab(unavailable_page, "FawBot OS")
 
     def update_robot_dropdown(self):
         """Populates the dropdown with saved robots and updates the URL display."""
@@ -317,7 +350,7 @@ class FawBotLauncher(QMainWindow):
         self.append_log(f"[LAUNCHING] Executing {selected_mode} ({script_filename})...\n")
 
         self.process = QProcess(self)
-        self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.process.setProcessChannelMode(QProcess.MergedChannels)
 
         self.process.readyReadStandardOutput.connect(self.handle_stdout)
         self.process.finished.connect(self.process_finished)
@@ -333,7 +366,7 @@ class FawBotLauncher(QMainWindow):
         self.btn_stop.setEnabled(True)
 
     def stop_script(self):
-        if self.process and self.process.state() != QProcess.ProcessState.NotRunning:
+        if self.process and self.process.state() != QProcess.NotRunning:
             self.append_log("[TERMINATING] Requesting process exit...\n")
             self.process.terminate()
             if not self.process.waitForFinished(2000):
@@ -352,12 +385,14 @@ class FawBotLauncher(QMainWindow):
         self.process = None
 
     def append_log(self, text):
-        self.log_output.moveCursor(QTextCursor.MoveOperation.End)
+        self.log_output.moveCursor(QTextCursor.End)
         self.log_output.insertPlainText(text)
-        self.log_output.moveCursor(QTextCursor.MoveOperation.End)
+        self.log_output.moveCursor(QTextCursor.End)
 
     def closeEvent(self, event):
         self.stop_script()
+        if self.fawbot_os_window:
+            self.fawbot_os_window.close()
         event.accept()
 
 
