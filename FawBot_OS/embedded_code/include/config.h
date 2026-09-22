@@ -5,6 +5,8 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <ESPAsyncWebServer.h>
+#include <Wire.h>
+#include <VL53L0X.h>
 
 // Set per robot, or override with PlatformIO build_flags (for example Fawbot_31).
 #ifndef ROBOT_NAME
@@ -63,10 +65,22 @@
 #define ECHO_PIN 18
 #endif
 
+#ifndef LIDAR_SDA
+#define LIDAR_SDA 21
+#endif
+
+#ifndef LIDAR_SCL
+#define LIDAR_SCL 22
+#endif
+
+#ifndef LIDAR_STEP_ANGLE_DEG
+#define LIDAR_STEP_ANGLE_DEG 1.0f
+#endif
+
 // --- MECHANICAL CONFIGURATION ---
 #define STEPS_PER_REV 4096.0
-#define WHEEL_DIAMETER_CM 6.5
-#define WHEEL_BASE_CM     10.0 
+#define WHEEL_DIAMETER_CM 5
+#define WHEEL_BASE_CM     10.2 
 #define WHEEL_CIRCUMFERENCE (3.14159 * WHEEL_DIAMETER_CM)
 
 // --- HARDCODED CALIBRATED STEPS PER CM ---
@@ -96,6 +110,15 @@ extern float currentDistance;
 
 extern bool irEnabled;
 extern bool ultrasonicEnabled;
+extern volatile bool lidarScanRequested;
+extern volatile bool lidarScanning;
+extern volatile bool lidarContinuous;
+extern volatile float lidarSweepDegrees;
+extern volatile float lidarStepAngleDegrees;
+extern volatile float lidarStepDistanceCm;
+extern volatile float lidarPoseX;
+extern volatile float lidarPoseY;
+extern volatile float lidarPoseHeading;
 
 extern AsyncWebServer server;
 extern AsyncEventSource events;
@@ -112,10 +135,15 @@ void moveManualStep(int dirL, int dirR);
 
 void initSensors();
 void updateSensors();
+void requestLidarScan();
+void requestContinuousLidarScan(float sweepDegrees, float stepDistanceCm);
+void stopLidarScan();
+void processLidarScan();
 
 void startWebPortal();
 void handleUDP();
 void serviceEmergencyStop();
+void sendUDPFeedback(String message);
 void sendLog(String msg);
 
 #endif

@@ -74,6 +74,10 @@ const char index_html[] PROGMEM = R"rawliteral(
     <div class="setting-row" style="margin-top:15px;">
         <button id="btnIR" class="btn-blue btn-toggle" onclick="toggleSensor('ir')">IR: ENABLED</button>
         <button id="btnUS" class="btn-blue btn-toggle" onclick="toggleSensor('us')">US: ENABLED</button>
+        <button id="btnLidar" class="btn-blue btn-toggle" onclick="toggleLidar()">Start 360 Lidar</button>
+        <div class="input-box"><label>Scan angle</label><input type="number" id="lidarAngle" value="180" step="5" min="5" max="360"></div>
+        <div class="input-box"><label>Forward step (cm)</label><input type="number" id="lidarDistance" value="10" min="0.1" step="0.1"></div>
+        <button id="btnContinuousLidar" class="btn-blue btn-toggle" onclick="toggleContinuousLidar()">Start Continuous Lidar</button>
     </div>
   </div>
 
@@ -84,6 +88,14 @@ const char index_html[] PROGMEM = R"rawliteral(
   function sendMoveCm(d) { fetch(`/move_cm?cm=${document.getElementById('moveCm').value}&dir=${d}`); }
   function sendTurn() { fetch(`/turn?deg=${document.getElementById('deg').value}`); }
   function updateConfig(param, val) { fetch(`/config?param=${param}&val=${val}`); }
+    function toggleLidar() {
+        const button = document.getElementById('btnLidar');
+        const start = button.innerText.startsWith('Start');
+        fetch(`/lidar?cmd=${start ? 'start' : 'stop'}`).then(() => {
+            button.innerText = start ? 'Stop Lidar' : 'Start 360 Lidar';
+            button.style.background = start ? '#dc3545' : '#007bff';
+        });
+    }
 
   function toggleSensor(type) {
     fetch(`/toggle?type=${type}`).then(r => r.text()).then(state => {
@@ -93,6 +105,18 @@ const char index_html[] PROGMEM = R"rawliteral(
        btn.style.background = isEnabled ? '#007bff' : '#dc3545';
     });
   }
+    function toggleContinuousLidar() {
+        const button = document.getElementById('btnContinuousLidar');
+        const start = button.innerText.startsWith('Start');
+        const angle = document.getElementById('lidarAngle').value;
+        const distance = document.getElementById('lidarDistance').value;
+        const url = start ? `/lidar?cmd=continuous&angle=${angle}&distance=${distance}` : '/lidar?cmd=stop';
+        fetch(url).then(response => {
+            if (!response.ok) return response.text().then(message => Promise.reject(message));
+            button.innerText = start ? 'Stop Continuous Lidar' : 'Start Continuous Lidar';
+            button.style.background = start ? '#dc3545' : '#007bff';
+        }).catch(message => alert(message));
+    }
 
   var source = new EventSource('/events');
   source.addEventListener('log', function(e) {
@@ -106,6 +130,11 @@ const char index_html[] PROGMEM = R"rawliteral(
     document.getElementById('r-ir').className = data.r ? "status-dot green" : "status-dot red";
     document.getElementById('dist-val').innerText = data.d;
   }, false);
+
+    source.addEventListener('lidar_packet', function(e) {
+        var c = document.getElementById('console');
+        c.innerHTML += 'LIDAR ' + e.data + '<br>'; c.scrollTop = c.scrollHeight;
+    }, false);
 </script></body></html>)rawliteral";
 
 // Helper function to send UDP feedback to Python
@@ -199,11 +228,35 @@ void startWebPortal() {
         r->send(200, "text/plain", state);
     });
 
+    server.on("/lidar", HTTP_GET, [](AsyncWebServerRequest *r){
+        String command = r->hasParam("cmd") ? r->getParam("cmd")->value() : "";
+        if (command == "continuous" && r->hasParam("angle") && r->hasParam("distance") && !lidarScanning) {
+            float angle = r->getParam("angle")->value().toFloat();
+            float distance = r->getParam("distance")->value().toFloat();
+            if (angle < 10.0 || angle > 360.0 || ((int)angle % 10) != 0 || distance <= 0.0) {
+                r->send(400, "text/plain", "angle must be a 10 degree multiple from 10-360 and distance must be positive");
+                return;
+            }
+            requestContinuousLidarScan(angle, distance);
+            r->send(200, "text/plain", "continuous scan started");
+        } else if (command == "start" && !lidarScanning) {
+            requestLidarScan();
+            r->send(200, "text/plain", "started");
+        } else if (command == "stop") {
+            stopLidarScan();
+            r->send(200, "text/plain", "stopping");
+        } else {
+            r->send(400, "text/plain", "Invalid lidar command");
+        }
+    });
+
     server.on("/stop", HTTP_GET, [](AsyncWebServerRequest *r){
         emergencyStop = true;
         isManualMoving = false;
         shouldMoveCm = false;
         shouldTurn = false;
+        lidarScanRequested = false;
+        lidarContinuous = false;
         stopMotors();
         r->send(200);
     });
@@ -293,12 +346,27 @@ void handleUDP() {
         }
         sendUDPFeedback("ACK:CFG");
     }
+    // 5. Continuous lidar scan: LIDAR:<sweep degrees>:<forward cm>
+    else if (msg.startsWith("LIDAR:")) {
+        int firstColon = msg.indexOf(':');
+        int secondColon = msg.indexOf(':', firstColon + 1);
+        if (secondColon != -1) {
+            float angle = msg.substring(firstColon + 1, secondColon).toFloat();
+            float distance = msg.substring(secondColon + 1).toFloat();
+            requestContinuousLidarScan(angle, distance);
+            sendUDPFeedback("ACK:LIDAR");
+        } else {
+            sendUDPFeedback("ERROR:LIDAR_FORMAT");
+        }
+    }
     // 5. Emergency Stop
     else if (msg == "STOP") {
         emergencyStop = true;
         isManualMoving = false;
         shouldMoveCm = false;
         shouldTurn = false;
+        lidarScanRequested = false;
+        lidarContinuous = false;
         stopMotors();
         sendUDPFeedback("ALERT:EMERGENCY_STOP");
     }

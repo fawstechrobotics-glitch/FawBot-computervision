@@ -11,6 +11,7 @@ from ui.styles import GAZEBO_DARK_STYLESHEET
 from ui.manual_control_page import ManualControlPage
 from ui.mission_planner_page import MissionPlannerPage
 from ui.swarming_page import SwarmingPage
+from ui.lidar_mapping_page import LidarMappingPage
 from robot.udp_communication import UDPCommunication
 from robot.robot_state import RobotState
 from robot.robot_controller import RobotController
@@ -100,6 +101,9 @@ class MainWindow(QMainWindow):
         )
         self.mission_page = MissionPlannerPage(self.mission_manager, self.controller, self.state)
         self.swarming_page = SwarmingPage(self.fleet)
+        primary_spec = self.fleet.roster.get(self.fleet.primary_id)
+        lidar_host = primary_spec.host if primary_spec else settings.ROBOT_HOST
+        self.lidar_page = LidarMappingPage(lidar_host, self.comm)
 
         # Keep every configured robot visible on both maps. The primary robot
         # continues to drive the existing single-robot controls.
@@ -118,6 +122,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.manual_page, "🎮 Manual Control")
         self.tabs.addTab(self.mission_page, "🗺️ Mission Path Planning")
         self.tabs.addTab(self.swarming_page, "💃 Swarming")
+        self.tabs.addTab(self.lidar_page, "📡 LiDAR Mapping")
 
         main_layout.addWidget(self.tabs)
 
@@ -140,11 +145,17 @@ class MainWindow(QMainWindow):
     def _connect_header_telemetry(self):
         # Update connection status
         self.comm.connection_status_changed.connect(self._on_conn_changed)
+        self.comm.feedback_received.connect(self.lidar_page.handle_udp_message)
 
         # Update global coordinates
         self.state.pose_changed.connect(
             lambda x, y, h: self.lbl_global_pose.setText(f"Pose: X: {x:.1f} cm | Y: {y:.1f} cm | Heading: {h:.1f}°")
         )
+        self.state.pose_changed.connect(self.lidar_page.set_robot_pose)
+        if self.state.pose:
+            self.lidar_page.set_robot_pose(
+                self.state.pose.x, self.state.pose.y, self.state.pose.heading
+            )
 
         # Update safety banner
         self.state.safety_halt_triggered.connect(self._on_safety_alert)
@@ -237,6 +248,7 @@ class MainWindow(QMainWindow):
         logger.info("Application closing...")
         self.controller.stop()
         self.mission_page.preview_timer.stop()
+        self.lidar_page.close()
         self.swarming_page.close()
         self.fleet.close()
         event.accept()
