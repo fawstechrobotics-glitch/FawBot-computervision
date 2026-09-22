@@ -1,6 +1,7 @@
 """Live VL53L0X continuous LiDAR mapping page."""
 import math
 import time
+import heapq
 import urllib.error
 import urllib.request
 from typing import List
@@ -65,6 +66,7 @@ class LidarMappingPage(QWidget):
     ROBOT_LENGTH_CM = 11.0
     ROBOT_WIDTH_CM = 9.0
     LIDAR_STEP_ANGLE_DEG = 1.0
+    ROUTE_TURN_SIGN = -1.0
 
     def __init__(self, host: str, comm, parent=None):
         super().__init__(parent)
@@ -83,9 +85,20 @@ class LidarMappingPage(QWidget):
         self.last_reached = ""
         self.mapping_active = False
         self.scan_points: List[tuple] = []
+        self.scan_points_by_angle = {}
         self.map_points: List[tuple] = []
         self.lidar_rays: List[tuple] = []
+        self.current_sweep_walls: List[tuple] = []
+        self.last_wall_segments: List[tuple] = []
+        self.sweep_segments_finalized = False
+        self.free_rays: List[tuple] = []
+        self.free_rays_by_angle = {}
         self.robot_trail: List[tuple] = []
+        self.home_pose = None
+        self.goal_point = None
+        self.route_points: List[tuple] = []
+        self.route_commands: List[tuple] = []
+        self.route_waiting_for = None
         self._is_panning = False
         self._pan_start = None
         self._pan_limits = None
@@ -103,6 +116,7 @@ class LidarMappingPage(QWidget):
         self.canvas.mpl_connect("button_press_event", self._on_mouse_press)
         self.canvas.mpl_connect("button_release_event", self._on_mouse_release)
         self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
+        self.canvas.mpl_connect("button_press_event", self._on_goal_click)
         self._draw_map()
         self.event_thread.packet_received.connect(self.handle_lidar_packet)
         self.event_thread.connection_changed.connect(self._on_connection_changed)
@@ -151,6 +165,14 @@ class LidarMappingPage(QWidget):
         clear_button = QPushButton("Clear")
         clear_button.clicked.connect(self.clear_scan)
         toolbar.addWidget(clear_button)
+        navigate_button = QPushButton("Navigate to Goal")
+        navigate_button.setObjectName("primaryBtn")
+        navigate_button.clicked.connect(self._plan_route_to_goal)
+        toolbar.addWidget(navigate_button)
+        emergency_button = QPushButton("Emergency Stop")
+        emergency_button.setObjectName("dangerBtn")
+        emergency_button.clicked.connect(self.emergency_stop)
+        toolbar.addWidget(emergency_button)
         fit_button = QPushButton("Fit View")
         fit_button.clicked.connect(self.fit_view)
         toolbar.addWidget(fit_button)
@@ -165,6 +187,15 @@ class LidarMappingPage(QWidget):
         layout.addWidget(self.telemetry_label)
         layout.addWidget(self.canvas)
 
+    def _on_goal_click(self, event):
+        if event.button != 1 or event.xdata is None or event.ydata is None:
+            return
+        self.goal_point = (float(event.xdata), float(event.ydata))
+        self._schedule_draw()
+        self.status_label.setText(
+            f"Goal selected at ({self.goal_point[0]:.1f}, {self.goal_point[1]:.1f}) cm"
+        )
+
     def _set_max_range(self, value: float):
         self.max_range_cm = value
         self._draw_map()
@@ -176,9 +207,11 @@ class LidarMappingPage(QWidget):
         )))
 
     def set_robot_pose(self, x: float, y: float, heading: float):
-        if not self.mapping_active:
+        if not self.mapping_active and not self.route_waiting_for and not self.route_commands:
             self.robot_x = float(x)
             self.robot_y = float(y)
+            if self.home_pose is None:
+                self.home_pose = (self.robot_x, self.robot_y)
             if not self.robot_trail:
                 self.robot_trail.append((self.robot_x, self.robot_y))
         self.robot_heading = float(heading)
@@ -203,34 +236,64 @@ class LidarMappingPage(QWidget):
         # unchanged here; it advances only after REACHED feedback arrives.
         self.last_angle = angle
 
+        half_sweep = self.sweep_degrees / 2.0
+        if angle < half_sweep:
+            scan_heading = self.robot_heading - (angle + self.LIDAR_STEP_ANGLE_DEG)
+        else:
+            scan_heading = self.robot_heading + (angle - half_sweep)
+        world_angle = math.radians(scan_heading)
+        direction_x = math.cos(world_angle)
+        direction_y = math.sin(world_angle)
+        sensor_offset = self.ROBOT_LENGTH_CM / 2.0
+        robot_heading_radians = math.radians(self.robot_heading)
+        sensor_origin = (
+            self.robot_x + sensor_offset * math.cos(robot_heading_radians),
+            self.robot_y + sensor_offset * math.sin(robot_heading_radians),
+        )
+        ray_key = round(angle, 2)
+
         if 0.0 < distance <= self.max_range_cm:
-            half_sweep = self.sweep_degrees / 2.0
-            if angle < half_sweep:
-                # During the first firmware phase the robot turns -1 deg
-                # before each reading, so packet angles run opposite to the
-                # physical clockwise scan direction.
-                scan_heading = self.robot_heading - (
-                    angle + self.LIDAR_STEP_ANGLE_DEG
-                )
-            else:
-                # The second phase turns +5 deg and already matches the map
-                # angle direction.
-                scan_heading = self.robot_heading + (angle - half_sweep)
-            world_angle = math.radians(scan_heading)
-            direction_x = math.cos(world_angle)
-            direction_y = math.sin(world_angle)
-            sensor_offset = self.ROBOT_LENGTH_CM / 2.0
-            sensor_origin = (
-                self.robot_x + sensor_offset * direction_x,
-                self.robot_y + sensor_offset * direction_y,
-            )
             endpoint = (
                 sensor_origin[0] + distance * direction_x,
                 sensor_origin[1] + distance * direction_y,
             )
             origin = sensor_origin
+            ray = (origin, endpoint)
+            previous_ray = self.scan_points_by_angle.get(ray_key)
+            if previous_ray is not None and previous_ray[0] <= distance:
+                return
+            if previous_ray is not None:
+                self.map_points.remove(previous_ray[1])
+                self.lidar_rays.remove(previous_ray[2])
+                self.current_sweep_walls = [
+                    item for item in self.current_sweep_walls
+                    if item[0] != angle
+                ]
+            free_ray = self.free_rays_by_angle.pop(ray_key, None)
+            if free_ray is not None:
+                self.free_rays.remove(free_ray)
             self.map_points.append(endpoint)
-            self.lidar_rays.append((origin, endpoint))
+            self.lidar_rays.append(ray)
+            self.scan_points_by_angle[ray_key] = (distance, endpoint, ray)
+            self.current_sweep_walls.append((angle, endpoint, ray))
+        else:
+            # A zero/invalid range means no wall was returned. Extend only
+            # that ray to the visible map limit and draw it in white.
+            free_endpoint = (
+                sensor_origin[0] + self.max_range_cm * direction_x,
+                sensor_origin[1] + self.max_range_cm * direction_y,
+            )
+            free_ray = (sensor_origin, free_endpoint)
+            previous_free_ray = self.free_rays_by_angle.get(ray_key)
+            if previous_free_ray is not None:
+                self.free_rays.remove(previous_free_ray)
+            self.free_rays.append(free_ray)
+            self.free_rays_by_angle[ray_key] = free_ray
+
+        if not self.sweep_segments_finalized and angle >= self.sweep_degrees - 0.01:
+            self._complete_wall_polygon()
+            self.sweep_segments_finalized = True
+            self.status_label.setText("Sweep complete; wall segments updated before forward move")
 
         self.status_label.setText(
             f"Receiving {self.sweep_degrees:.0f} deg scan, angle {angle:.0f} deg"
@@ -257,9 +320,34 @@ class LidarMappingPage(QWidget):
                     return
                 self.robot_trail.append((self.robot_x, self.robot_y))
                 self.last_angle = None
+                self.scan_points_by_angle.clear()
+                self.free_rays.clear()
+                self.free_rays_by_angle.clear()
+                self.sweep_segments_finalized = False
+                if self.route_waiting_for == "MOVE":
+                    self.route_waiting_for = None
+                    self._send_next_route_command()
                 self.status_label.setText("Physical move reached; mapping pose confirmed")
                 self._update_telemetry()
                 self._schedule_draw()
+        elif message.startswith("COMPLETED:TURN") and self.route_waiting_for == "TURN":
+            self.robot_heading = getattr(self, "navigation_target_heading", self.robot_heading)
+            self.route_waiting_for = None
+            self._update_telemetry()
+            self._schedule_draw()
+            self._send_next_route_command()
+        elif message.startswith("COMPLETED:MOVE") and self.route_waiting_for == "MOVE":
+            if hasattr(self, "navigation_target"):
+                self.robot_x, self.robot_y = self.navigation_target
+                self.robot_trail.append((self.robot_x, self.robot_y))
+                self._update_telemetry()
+                self._schedule_draw()
+            self.route_waiting_for = None
+            self._send_next_route_command()
+        elif message.startswith("ALERT:") and self.route_waiting_for:
+            self.route_commands.clear()
+            self.route_waiting_for = None
+            self.status_label.setText("Route stopped by robot safety alert")
 
     def toggle_scan(self):
         if self.scan_button.text().startswith("Stop"):
@@ -272,6 +360,11 @@ class LidarMappingPage(QWidget):
         self.sweep_degrees = self.sweep_spin.value()
         self.forward_step_cm = self.step_spin.value()
         self.last_angle = None
+        self.scan_points_by_angle.clear()
+        self.current_sweep_walls.clear()
+        self.free_rays.clear()
+        self.free_rays_by_angle.clear()
+        self.sweep_segments_finalized = False
         self.mapping_active = True
         self.comm.send_command(
             f"LIDAR:{self.sweep_degrees:g}:{self.forward_step_cm:g}:"
@@ -282,6 +375,190 @@ class LidarMappingPage(QWidget):
             f"Starting {self.sweep_degrees:.0f} deg scan / "
             f"{self.forward_step_cm:.1f} cm step"
         )
+
+    def emergency_stop(self):
+        """Immediately stop physical motion and cancel all LiDAR navigation."""
+        self.comm.send_command("STOP")
+        self.mapping_active = False
+        self.route_commands.clear()
+        self.route_waiting_for = None
+        self.scan_button.setText("Start 180 deg / 10 cm")
+        self.status_label.setText("EMERGENCY STOP SENT")
+        self.status_label.setStyleSheet("color: #ff3366; font-family: monospace; font-weight: bold;")
+
+    def _plan_route_to_goal(self):
+        if self.goal_point is None:
+            return
+        if self.route_waiting_for or self.route_commands:
+            self.status_label.setText("A route is already executing")
+            return
+        start = (self.robot_x, self.robot_y)
+        goal = self.goal_point
+        if math.dist(start, goal) < 1.0:
+            self.status_label.setText("Goal is already reached")
+            return
+
+        if self.mapping_active:
+            self.comm.send_command("STOP")
+            self.mapping_active = False
+            self.scan_button.setText("Start 180 deg / 10 cm")
+
+        route = self._astar_route(start, goal)
+        if not route:
+            self.status_label.setText("No safe route found to selected goal")
+            return
+        self.route_points = route
+        self.route_commands = self._route_to_commands(route)
+        self.status_label.setText("Safe route planned; waiting to execute")
+        QTimer.singleShot(350, self._send_next_route_command)
+
+    def _astar_route(self, start, goal):
+        grid = 2.0
+        clearance = math.hypot(
+            self.ROBOT_LENGTH_CM / 2.0,
+            self.ROBOT_WIDTH_CM / 2.0,
+        ) + 2.0
+        occupied = set()
+        obstacle_segments = list(self.last_wall_segments)
+
+        def point_segment_distance(point, first, second):
+            dx = second[0] - first[0]
+            dy = second[1] - first[1]
+            length_squared = dx * dx + dy * dy
+            if length_squared == 0.0:
+                return math.dist(point, first)
+            projection = ((point[0] - first[0]) * dx + (point[1] - first[1]) * dy) / length_squared
+            projection = max(0.0, min(1.0, projection))
+            nearest = (first[0] + projection * dx, first[1] + projection * dy)
+            return math.dist(point, nearest)
+
+        def is_blocked(point):
+            return any(
+                point_segment_distance(point, first, second) <= clearance
+                for first, second in obstacle_segments
+            )
+
+        def line_is_clear(first, second):
+            sample_count = max(2, int(math.ceil(math.dist(first, second) / (grid / 2.0))))
+            for index in range(sample_count + 1):
+                factor = index / sample_count
+                sample = (
+                    first[0] + (second[0] - first[0]) * factor,
+                    first[1] + (second[1] - first[1]) * factor,
+                )
+                if is_blocked(sample):
+                    return False
+            return True
+
+        all_obstacle_points = [point for segment in obstacle_segments for point in segment]
+        all_points = [start, goal] + all_obstacle_points
+        min_x = min(point[0] for point in all_points) - 30.0
+        max_x = max(point[0] for point in all_points) + 30.0
+        min_y = min(point[1] for point in all_points) - 30.0
+        max_y = max(point[1] for point in all_points) + 30.0
+
+        def to_cell(point):
+            return round((point[0] - min_x) / grid), round((point[1] - min_y) / grid)
+
+        def to_world(cell):
+            return min_x + cell[0] * grid, min_y + cell[1] * grid
+
+        max_cell_x = int(math.ceil((max_x - min_x) / grid))
+        max_cell_y = int(math.ceil((max_y - min_y) / grid))
+        for cell_x in range(max_cell_x + 1):
+            for cell_y in range(max_cell_y + 1):
+                if is_blocked(to_world((cell_x, cell_y))):
+                    occupied.add((cell_x, cell_y))
+
+        start_cell = to_cell(start)
+        goal_cell = to_cell(goal)
+        occupied.discard(start_cell)
+        occupied.discard(goal_cell)
+        frontier = [(0.0, start_cell)]
+        came_from = {start_cell: None}
+        cost = {start_cell: 0.0}
+        while frontier:
+            _, current = heapq.heappop(frontier)
+            if current == goal_cell:
+                break
+            for step_x, step_y in (
+                (1, 0), (-1, 0), (0, 1), (0, -1),
+                (1, 1), (1, -1), (-1, 1), (-1, -1),
+            ):
+                neighbor = (current[0] + step_x, current[1] + step_y)
+                if neighbor in occupied or not (
+                    0 <= neighbor[0] <= max_cell_x and
+                    0 <= neighbor[1] <= max_cell_y
+                ):
+                    continue
+                if step_x and step_y:
+                    if ((current[0] + step_x, current[1]) in occupied or
+                            (current[0], current[1] + step_y) in occupied):
+                        continue
+                new_cost = cost[current] + math.hypot(step_x, step_y)
+                if new_cost < cost.get(neighbor, float("inf")):
+                    cost[neighbor] = new_cost
+                    priority = new_cost + math.dist(to_world(neighbor), goal)
+                    heapq.heappush(frontier, (priority, neighbor))
+                    came_from[neighbor] = current
+        if goal_cell not in came_from:
+            return []
+        cells = []
+        current = goal_cell
+        while current is not None:
+            cells.append(current)
+            current = came_from[current]
+        cells.reverse()
+        raw_route = [to_world(cell) for cell in reversed(cells)]
+        simplified = [raw_route[0]]
+        anchor = 0
+        while anchor < len(raw_route) - 1:
+            furthest = anchor + 1
+            for candidate in range(anchor + 1, len(raw_route)):
+                if line_is_clear(raw_route[anchor], raw_route[candidate]):
+                    furthest = candidate
+                else:
+                    break
+            simplified.append(raw_route[furthest])
+            anchor = furthest
+        simplified[-1] = goal
+        return simplified
+
+    def _route_to_commands(self, route):
+        commands = []
+        current_heading = self.robot_heading
+        for first, second in zip(route, route[1:]):
+            dx = second[0] - first[0]
+            dy = second[1] - first[1]
+            distance = math.hypot(dx, dy)
+            target_heading = math.degrees(math.atan2(dy, dx))
+            turn = ((target_heading - current_heading + 180.0) % 360.0) - 180.0
+            if abs(turn) > 0.5:
+                commands.append(("TURN", turn, target_heading))
+                current_heading = target_heading
+            commands.append(("MOVE", distance, second[0], second[1]))
+        return commands
+
+    def _send_next_route_command(self):
+        if self.route_waiting_for:
+            return
+        if not self.route_commands:
+            self.route_waiting_for = None
+            self.status_label.setText("Goal reached")
+            return
+        command_data = self.route_commands.pop(0)
+        command, value = command_data[:2]
+        self.route_waiting_for = command
+        if command == "TURN":
+            desired_heading = command_data[2]
+            physical_turn = ((desired_heading - self.robot_heading + 180.0) % 360.0) - 180.0
+            physical_turn *= self.ROUTE_TURN_SIGN
+            self.navigation_target_heading = desired_heading % 360.0
+            self.comm.send_command(f"TURN:{physical_turn:.1f}")
+        else:
+            self.navigation_target = (command_data[2], command_data[3])
+            self.comm.send_command(f"MOVE:{value:.1f}:1.0")
+        self.status_label.setText(f"Executing route: {command} {value:.1f}")
 
     def _update_telemetry(self):
         self.telemetry_label.setText(
@@ -303,7 +580,17 @@ class LidarMappingPage(QWidget):
     def clear_scan(self):
         self.map_points.clear()
         self.lidar_rays.clear()
+        self.current_sweep_walls.clear()
+        self.last_wall_segments.clear()
+        self.sweep_segments_finalized = False
         self.robot_trail.clear()
+        self.goal_point = None
+        self.route_points.clear()
+        self.route_commands.clear()
+        self.route_waiting_for = None
+        self.scan_points_by_angle.clear()
+        self.free_rays.clear()
+        self.free_rays_by_angle.clear()
         self.last_angle = None
         self.last_packet = ""
         self.last_packet_time = 0.0
@@ -312,6 +599,27 @@ class LidarMappingPage(QWidget):
         self.status_label.setStyleSheet("color: #ffcc00; font-family: monospace;")
         self._update_telemetry()
         self._draw_map()
+
+    def _complete_wall_polygon(self):
+        """Create adjacent wall segments and remove raw sweep points."""
+        walls = sorted(self.current_sweep_walls, key=lambda item: item[0])
+        if len(walls) < 2:
+            self.current_sweep_walls.clear()
+            return
+
+        wall_points = [item[1] for item in walls]
+        max_connection_gap_cm = 5.0
+        self.last_wall_segments = []
+        for start, end in zip(wall_points, wall_points[1:]):
+            if math.dist(start, end) <= max_connection_gap_cm:
+                self.last_wall_segments.append((start, end))
+
+        for _, endpoint, ray in self.current_sweep_walls:
+            if endpoint in self.map_points:
+                self.map_points.remove(endpoint)
+            if ray in self.lidar_rays:
+                self.lidar_rays.remove(ray)
+        self.current_sweep_walls.clear()
 
     def fit_view(self):
         """Fit the viewport to all map points and return to automatic tracking."""
@@ -411,10 +719,49 @@ class LidarMappingPage(QWidget):
                 label="Clear path",
             ))
 
+        if self.free_rays:
+            self.axes.add_collection(LineCollection(
+                self.free_rays,
+                colors="#ffffff",
+                linewidths=0.7,
+                alpha=0.6,
+                zorder=1,
+                label="Open space",
+            ))
+
+        if self.last_wall_segments:
+            self.axes.add_collection(LineCollection(
+                self.last_wall_segments,
+                colors="#e53935",
+                linewidths=2.0,
+                alpha=0.95,
+                zorder=4,
+                label="Adjacent wall segments",
+            ))
+
         if len(self.robot_trail) > 1:
             trail_x, trail_y = zip(*self.robot_trail)
             self.axes.plot(trail_x, trail_y, color="#b0b0b0", linewidth=2.5,
                            linestyle="-", alpha=0.95, label="Clear path")
+
+        if self.route_points and len(self.route_points) > 1:
+            route_x, route_y = zip(*self.route_points)
+            self.axes.plot(route_x, route_y, color="#00d2ff", linewidth=1.5,
+                           linestyle="--", alpha=0.85, label="Planned route")
+
+        if self.home_pose:
+            self.axes.scatter(
+                [self.home_pose[0]], [self.home_pose[1]],
+                marker="*", s=130, color="#00ffaa", edgecolors="white",
+                linewidths=0.8, zorder=6, label="Home",
+            )
+
+        if self.goal_point:
+            self.axes.scatter(
+                [self.goal_point[0]], [self.goal_point[1]],
+                marker="X", s=100, color="#ff9900", edgecolors="white",
+                linewidths=0.8, zorder=6, label="Goal",
+            )
 
         half_length = self.ROBOT_LENGTH_CM / 2.0
         half_width = self.ROBOT_WIDTH_CM / 2.0

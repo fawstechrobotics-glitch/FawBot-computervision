@@ -23,6 +23,10 @@ The desktop application does not directly drive motors. It sends commands to the
 - VL53L0X LiDAR scanning over I2C
 - Continuous LiDAR mapping: sweep, move forward, confirm position, repeat
 - Persistent wall points and ash-gray measurement rays
+- Open-space white rays for zero/invalid range readings
+- Adjacent wall-segment rendering with gap filtering
+- Click-to-goal navigation around measured wall-line obstacles
+- Dedicated LiDAR-page emergency stop
 - Front-mounted sensor geometry and 11 x 9 cm robot footprint
 - LiDAR map zoom, pan, and Fit View controls
 
@@ -92,9 +96,55 @@ FawBot_OS/
     ├── src/sensors.cpp              IR, ultrasonic, and VL53L0X LiDAR logic
     ├── src/stepper_control.cpp      Motor stepping, movement, and turns
     ├── src/web_portal.cpp            HTTP dashboard, SSE, and UDP protocol
-    ├── lib/                          Private PlatformIO libraries
-    └── test/                         PlatformIO test directory
+    ├── lib/                         Private PlatformIO libraries
+    └── test/                        PlatformIO test directory
 ```
+
+### Python module reference
+
+| Module | Responsibility |
+|---|---|
+| `main.py` | Creates the Qt application, configures logging, and opens `MainWindow`. |
+| `Advance_turtlesim.py` | Compatibility launcher for older workflows. |
+| `config/settings.py` | Central network settings, dimensions, kinematics, thresholds, timing, and directories. |
+| `models/pose.py` | Pose values, heading normalization, and vector/angle helpers. |
+| `models/obstacle.py` | Boundary and restricted-area polygon data models. |
+| `models/path.py` | Path points and executable `MOVE`/`TURN` command conversion. |
+| `models/mission.py` | Mission, environment, robot, path, and versioned JSON schema. |
+| `robot/udp_communication.py` | UDP socket creation, background listener thread, feedback signals, and command transmission. |
+| `robot/robot_state.py` | Observable pose, execution flags, safety state, initial pose, and travel trails. |
+| `robot/robot_controller.py` | Sends motion commands and interpolates the virtual robot for ordinary manual/mission motion. |
+| `robot/fleet.py` | Parses `assigned_robot.txt` and defines robot identities/start poses. |
+| `robot/fleet_controller.py` | Owns independent communication, state, and controller objects for each robot. |
+| `navigation/geometry.py` | Footprint generation, polygon tests, segment tests, and swept trajectory validation. |
+| `navigation/lidar_protocol.py` | Decodes firmware 5-byte hexadecimal LiDAR packets. |
+| `navigation/path_recorder.py` | Filters jitter and converts teach-mode driving into mission points. |
+| `navigation/path_planner.py` | Planner abstraction and recorded-path implementation; autonomous planner hooks are reserved here. |
+| `navigation/navigation_executor.py` | Runs mission command execution without blocking the GUI. |
+| `navigation/mission_manager.py` | Coordinates mission lifecycle, validation, execution, and fleet operations. |
+| `storage/mission_storage.py` | Saves, loads, lists, deletes, and validates mission JSON files. |
+| `ui/main_window.py` | Builds tabs, global status bar, keyboard teleoperation, shared state wiring, and shutdown. |
+| `ui/manual_control_page.py` | Manual drive controls, robot map, home/backtrack controls, and telemetry. |
+| `ui/mission_planner_page.py` | Mission editor, waypoints, boundaries, restricted areas, validation, preview, and execution controls. |
+| `ui/swarming_page.py` | Multi-robot destination assignment and fleet operations. |
+| `ui/map_widget.py` | Reusable Matplotlib CAD viewport with grid, robot footprints, trails, targets, and mission overlays. |
+| `ui/lidar_mapping_page.py` | VL53L0X stream, dynamic rays/walls, sweep state, pose handshake, route planning, goal navigation, and emergency stop. |
+| `ui/styles.py` | Shared PyQt and Matplotlib dark workbench styling. |
+
+### Embedded module reference
+
+| File | Responsibility |
+|---|---|
+| `embedded_code/platformio.ini` | ESP32 board/framework settings, libraries, robot build environments, and per-robot pin/name flags. |
+| `embedded_code/assigned_robot.txt` | Desktop fleet roster: robot ID, mDNS host, UDP port, initial X/Y, and heading. |
+| `embedded_code/include/config.h` | Shared includes, motor/sensor pins, I2C pins, mechanical constants, LiDAR defaults, globals, and function declarations. |
+| `embedded_code/src/main.cpp` | `setup()`, main loop, 100 ms sensor updates, safety halt evaluation, LiDAR job dispatch, and ordinary motion dispatch. |
+| `embedded_code/src/sensors.cpp` | IR/ultrasonic reads, VL53L0X initialization, sweep stepping, packet encoding, continuous mapping, and confirmed pose feedback. |
+| `embedded_code/src/stepper_control.cpp` | 8-state half-step motor sequence, speed delay, centimeter movement, turn movement, manual stepping, and motor stop. |
+| `embedded_code/src/web_portal.cpp` | Wi-Fi/mDNS, HTTP dashboard routes, SSE event stream, UDP command parser, UDP feedback, and stop handling. |
+| `embedded_code/.pio/` | PlatformIO generated dependencies/build products; do not edit manually. |
+| `embedded_code/lib/` | Location for project-private PlatformIO libraries. |
+| `embedded_code/test/` | PlatformIO test-runner directory. |
 
 ---
 
@@ -148,9 +198,29 @@ Default LiDAR pins:
 | VL53L0X SDA | GPIO 21 |
 | VL53L0X SCL | GPIO 22 |
 
-The LiDAR is mounted at the **front center** of the robot. The GUI uses an 11 cm robot length and 9 cm width. The sensor origin is therefore 5.5 cm in front of the robot center along the current measurement ray.
+The LiDAR is mounted at the **front center** of the robot. The GUI uses an 11 cm robot length and 9 cm width. The sensor origin is therefore fixed 5.5 cm in front of the robot center along the robot heading; only the measurement ray direction changes during a sweep.
 
 A LiDAR distance of 1 cm means the wall is 1 cm beyond the front-mounted sensor, not 1 cm from the robot center.
+
+### Motion and kinematics
+
+The firmware drives both 28BYJ-48 motors with an 8-state half-step sequence.
+Current embedded defaults are:
+
+| Value | Default |
+|---|---:|
+| Wheel diameter | `5.0 cm` |
+| Wheel base | `10.2 cm` |
+| Calibrated steps per centimeter | `256.81` |
+| Startup step delay | `1000 us` |
+| Speed delay range | `3000 us` to `650 us` |
+| LiDAR step angle | `1.0 deg` |
+
+Linear movement is sent as `MOVE:distance:direction`. In-place rotation is
+sent as `TURN:angle`. The desktop mission controller uses mathematical headings
+where `0 deg` points along +X and `90 deg` points along +Y. The LiDAR goal
+planner applies the configured route turn sign when converting that heading into
+the physical motor command for the current wiring profile.
 
 ---
 
@@ -193,6 +263,7 @@ TOGGLE:us
 CFG:delay:<microseconds>
 CFG:obs:<distance_cm>
 CFG:lidar_step:<degrees>
+LIDAR:<sweep_degrees>:<forward_cm>:<x>:<y>:<heading>
 ```
 
 Examples:
@@ -202,6 +273,7 @@ MOVE:10.0:1.0
 TURN:15.0
 STOP
 CFG:lidar_step:1
+LIDAR:180:10:60.00:20.00:90.00
 ```
 
 ### Feedback sent by the firmware
@@ -214,9 +286,19 @@ ACK:TOGGLE
 ACK:LIDAR
 ALERT:EMERGENCY_STOP
 ALERT:SAFETY_HALT
+REACHED:LIDAR:<x>:<y>:<heading>
 ```
 
 The Python controller uses completion and alert messages to update execution state. The LiDAR page uses the LiDAR-specific messages described below.
+
+The firmware also publishes these SSE event names on `/events`:
+
+| Event | Payload | Consumer |
+|---|---|---|
+| `sensor_data` | IR left/right state and ultrasonic distance JSON | Web dashboard and telemetry UI |
+| `log` | Human-readable firmware log | Web dashboard |
+| `lidar_packet` | Encoded VL53L0X measurement | LiDAR mapping page |
+| `robot_pose` | Confirmed `REACHED:LIDAR` pose | LiDAR mapping page |
 
 ---
 
@@ -294,6 +376,10 @@ The GUI does **not** advance the virtual robot when a scan packet arrives. It ad
 
 This handshake keeps the virtual map pose synchronized with the real robot.
 
+The GUI also listens for `LIDAR_PACKET:<hex>` on UDP because UDP is the command
+socket used by the desktop process. The same packet is available through SSE;
+duplicate UDP/SSE packets and duplicate pose confirmations are ignored.
+
 ### LiDAR step angle
 
 The firmware default is configured by:
@@ -316,8 +402,16 @@ The LiDAR page stores each measurement in world coordinates:
 
 - Ash-gray line: sensor-to-measured-point ray
 - Red endpoint: detected wall return
+- White max-range line: no wall/invalid range for that angle
 - Ash-gray solid trail: robot travel path
 - Yellow footprint: robot at 11 x 9 cm
+- Red adjacent wall segments: completed sweep wall returns
+
+Raw wall points are sorted by sweep angle. Adjacent points are connected only
+when their distance is at most `1.0 cm`; gaps remain open and the scan is never
+closed into a last-point-to-first-point loop. Raw points are removed after the
+completed sweep segments are generated, and the latest segment set replaces the
+previous one.
 
 The page supports:
 
@@ -327,6 +421,37 @@ The page supports:
 - Clear map
 - Maximum range filtering
 - Sweep angle and forward distance controls
+
+### Click-to-goal navigation
+
+The LiDAR page records the first confirmed robot pose as **Home**. While a map
+is available, click a location inside the plot to select a **Goal**, then click
+**Navigate to Goal** to begin navigation. Selecting a point does not move the
+robot by itself. The page
+inflates the red wall-line segments by the robot footprint and safety clearance,
+then uses a fine 2 cm, 8-connected A* search. Diagonal corner cutting is
+blocked, and a line-of-sight simplifier removes unnecessary grid corners. The
+result is a sequence of straight route legs drawn in blue before motion starts.
+
+The planner treats each red wall segment as an obstacle. A route leg is accepted
+only when its sampled line remains outside the inflated wall segments.
+
+For each LiDAR sweep, the mapper keeps the nearest return for each angular ray.
+A farther return behind a nearer wall is discarded, while points from previous
+robot positions remain in the accumulated map.
+
+The continuous LiDAR routine is paused before navigation because the current
+firmware sweep is a blocking operation. The GUI sends sequential `TURN` and
+`MOVE` commands for the planned route and updates the virtual robot only after
+the corresponding `COMPLETED` feedback arrives. The firmware IR and ultrasonic
+safety halt remains active during the route. Route turn signs are calibrated
+separately from the mathematical map heading so the physical robot and virtual
+robot face the same direction. Restart continuous mapping after the robot
+reaches the goal if a new map is required.
+
+Clicking a map position only selects a goal. The robot starts only after
+**Navigate to Goal** is pressed. **Emergency Stop** sends `STOP`, cancels the
+queued route and continuous mapping, and leaves the current map visible.
 
 ---
 
@@ -433,7 +558,8 @@ python Advance_turtlesim.py
 9. Click **Start 180 deg / 10 cm**.
 10. Watch for LiDAR rays, red wall endpoints, robot movement, and confirmed pose updates.
 11. Click **Stop Continuous Scan** to stop the robot.
-12. Use **Fit View** to fit the accumulated map.
+12. Use **Emergency Stop** to immediately send `STOP` and cancel scanning or route navigation.
+13. Use **Fit View** to fit the accumulated map.
 
 Start with a small forward distance in an open area. Keep the physical robot clear of obstacles and be ready to use the stop control.
 
@@ -449,6 +575,9 @@ The firmware can stop movement when:
 - A LiDAR continuous scan is stopped
 
 The Python GUI also reacts to safety feedback and updates the global safety indicator.
+
+The LiDAR page emergency-stop button is independent of map clearing: it stops
+motion and queued commands but leaves the rendered map available for diagnosis.
 
 The LiDAR sensor is used for mapping in the current implementation. IR and ultrasonic sensors provide the primary firmware safety halt behavior.
 
