@@ -28,7 +28,11 @@ volatile bool lidarScanRequested = false;
 volatile bool lidarScanning = false;
 volatile bool lidarContinuous = false;
 volatile float lidarSweepDegrees = 360.0;
+volatile float lidarStepAngleDegrees = LIDAR_STEP_ANGLE_DEG;
 volatile float lidarStepDistanceCm = 0.0;
+volatile float lidarPoseX = 0.0;
+volatile float lidarPoseY = 0.0;
+volatile float lidarPoseHeading = 0.0;
 
 AsyncWebServer server(80);
 AsyncEventSource events("/events");

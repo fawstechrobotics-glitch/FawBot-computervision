@@ -6,6 +6,52 @@ from models.pose import Pose
 from models.obstacle import Boundary, RestrictedArea
 
 
+def normalize_angle(angle_rad: float) -> float:
+    """Normalizes an angle in radians to the range [-pi, pi]."""
+    return math.atan2(math.sin(angle_rad), math.cos(angle_rad))
+
+
+def normalize_angle_deg(angle_deg: float) -> float:
+    """Normalizes an angle in degrees to the range [-180, 180]."""
+    rad = math.radians(angle_deg)
+    return math.degrees(math.atan2(math.sin(rad), math.cos(rad)))
+
+
+def calculate_distance(p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
+    """Calculates Euclidean distance between two 2D points (x1, y1) and (x2, y2)."""
+    return math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+
+
+def calculate_heading(current_pose: Tuple[float, float], target_point: Tuple[float, float]) -> float:
+    """
+    Calculates absolute heading angle (in degrees) from current_pose (x, y) 
+    to target_point (x, y) in standard Cartesian space (+X East/Right, +Y North/Up).
+    """
+    dx = target_point[0] - current_pose[0]
+    dy = target_point[1] - current_pose[1]  # Standard Cartesian: dy = target_y - current_y
+    return math.degrees(math.atan2(dy, dx))
+
+
+def calculate_turn_angle(current_heading_deg: float, target_point: Tuple[float, float], current_pose: Tuple[float, float]) -> float:
+    """
+    Calculates relative turn angle (in degrees) required to rotate from current_heading_deg 
+    towards target_point. Result is normalized in [-180, 180].
+    """
+    target_abs = calculate_heading(current_pose, target_point)
+    raw_turn = target_abs - current_heading_deg
+    return normalize_angle_deg(raw_turn)
+
+
+def ui_to_cartesian(ui_x: float, ui_y: float, map_height: float, scale_factor: float = 1.0) -> Tuple[float, float]:
+    """
+    Converts GUI pixel coordinates (Top-Left Origin, +Y Down) 
+    to Robot Cartesian coordinates (Bottom-Left Origin, +Y Up).
+    """
+    cartesian_x = ui_x * scale_factor
+    cartesian_y = (map_height - ui_y) * scale_factor
+    return cartesian_x, cartesian_y
+
+
 def compute_robot_footprint(
     x: float,
     y: float,
@@ -53,7 +99,6 @@ def point_in_polygon(point: Tuple[float, float], polygon: List[Tuple[float, floa
     for i in range(n):
         p1 = polygon[i]
         p2 = polygon[(i + 1) % n]
-        # Cross product to check collinearity
         cross = (x - p1[0]) * (p2[1] - p1[1]) - (y - p1[1]) * (p2[0] - p1[0])
         if abs(cross) < 1e-7:
             if min(p1[0], p2[0]) - 1e-7 <= x <= max(p1[0], p2[0]) + 1e-7 and \
@@ -88,7 +133,6 @@ def segments_intersect(
     p4: Tuple[float, float]
 ) -> bool:
     """Test if line segment (p1-p2) intersects line segment (p3-p4)."""
-    # Quick bounding box rejection
     if (max(p1[0], p2[0]) < min(p3[0], p4[0]) or
         max(p3[0], p4[0]) < min(p1[0], p2[0]) or
         max(p1[1], p2[1]) < min(p3[1], p4[1]) or
@@ -100,12 +144,10 @@ def segments_intersect(
     d3 = _ccw(p1, p2, p3)
     d4 = _ccw(p1, p2, p4)
 
-    # General intersection (straddle)
     if ((d1 > 0 and d2 < 0) or (d1 < 0 and d2 > 0)) and \
        ((d3 > 0 and d4 < 0) or (d3 < 0 and d4 > 0)):
         return True
 
-    # Collinear overlap check
     def on_segment(p, a, b):
         return min(a[0], b[0]) <= p[0] <= max(a[0], b[0]) and min(a[1], b[1]) <= p[1] <= max(a[1], b[1])
 
@@ -125,7 +167,6 @@ def polygon_intersects_polygon(
     n1 = len(poly1)
     n2 = len(poly2)
 
-    # 1. Test for edge-edge intersections
     for i in range(n1):
         e1_p1 = poly1[i]
         e1_p2 = poly1[(i + 1) % n1]
@@ -135,11 +176,9 @@ def polygon_intersects_polygon(
             if segments_intersect(e1_p1, e1_p2, e2_p1, e2_p2):
                 return True
 
-    # 2. Test if poly1 is inside poly2
     if n1 > 0 and point_in_polygon(poly1[0], poly2):
         return True
 
-    # 3. Test if poly2 is inside poly1
     if n2 > 0 and point_in_polygon(poly2[0], poly1):
         return True
 
@@ -151,19 +190,19 @@ def is_footprint_within_boundary(
     boundary: Boundary
 ) -> bool:
     """Ensure all vertices of the robot footprint remain inside the boundary polygon."""
+    if not boundary.enabled or not boundary.polygon:
+        return True
+
     b_poly = boundary.polygon
     min_x, min_y, max_x, max_y = boundary.bounding_box
 
-    # Quick bounding box check
     for vx, vy in footprint:
         if vx < min_x or vx > max_x or vy < min_y or vy > max_y:
             return False
 
-    # If rectangular, bounding box check is necessary and sufficient
     if len(b_poly) == 4 and min_x == 0 and min_y == 0:
         return True
 
-    # Arbitrary polygon containment
     for pt in footprint:
         if not point_in_polygon(pt, b_poly):
             return False
@@ -172,7 +211,7 @@ def is_footprint_within_boundary(
 
 
 def validate_trajectory(
-    path_points: List[Tuple[float, float, float]],  # List of (x, y, heading)
+    path_points: List[Tuple[float, float, float]],
     robot_length: float,
     robot_width: float,
     safety_margin: float,
@@ -180,16 +219,12 @@ def validate_trajectory(
     restricted_areas: List[RestrictedArea],
     sample_step_cm: float = 2.0
 ) -> Tuple[bool, List[str]]:
-    """
-    Validates complete robot trajectory against environment boundary and restricted areas.
-    Performs swept-volume footprint collision checks along each segment.
-    """
+    """Validates complete robot trajectory against environment boundary and restricted areas."""
     errors = []
 
     if not path_points:
         return True, []
 
-    # Check start pose
     start_x, start_y, start_h = path_points[0]
     if boundary.enabled and boundary.polygon:
         fp_start = compute_robot_footprint(start_x, start_y, start_h, robot_length, robot_width, safety_margin)
@@ -203,7 +238,6 @@ def validate_trajectory(
             if polygon_intersects_polygon(fp_start, ra.polygon):
                 errors.append(f"Start Pose ({start_x:.1f}, {start_y:.1f}) collides with Restricted Area '{ra.name}'.")
 
-    # Check consecutive path segments
     for idx in range(len(path_points) - 1):
         p1 = path_points[idx]
         p2 = path_points[idx + 1]
@@ -218,15 +252,12 @@ def validate_trajectory(
             t = s / steps
             interp_x = p1[0] + (p2[0] - p1[0]) * t
             interp_y = p1[1] + (p2[1] - p1[1]) * t
-            # Angular interpolation along shortest arc
-            d_angle = p2[2] - p1[2]
-            while d_angle > 180.0: d_angle -= 360.0
-            while d_angle < -180.0: d_angle += 360.0
+            
+            d_angle = normalize_angle_deg(p2[2] - p1[2])
             interp_h = p1[2] + d_angle * t
 
             fp = compute_robot_footprint(interp_x, interp_y, interp_h, robot_length, robot_width, safety_margin)
 
-            # Only check boundary when it is explicitly enabled
             if boundary.enabled and boundary.polygon:
                 if not is_footprint_within_boundary(fp, boundary) and not seg_exceeded_boundary:
                     seg_exceeded_boundary = True

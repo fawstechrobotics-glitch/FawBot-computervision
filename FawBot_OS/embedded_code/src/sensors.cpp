@@ -28,9 +28,10 @@ void initSensors() {
     pinMode(ECHO_PIN, INPUT);
 
     Wire.begin(LIDAR_SDA, LIDAR_SCL);
-    lidar.setTimeout(100);
+    lidar.setTimeout(200);
     lidarReady = lidar.init();
     if (lidarReady) {
+        lidar.setMeasurementTimingBudget(33000);
         lidar.startContinuous();
         sendLog("VL53L0X lidar ready");
     } else {
@@ -90,11 +91,32 @@ void stopLidarScan() {
     emergencyStop = true;
 }
 
-static bool readAndSendLidar(uint16_t packetAngle) {
+static uint16_t readLidarDistanceMm() {
+    if (!lidarReady) {
+        return 0;
+    }
     uint16_t distanceMm = lidar.readRangeContinuousMillimeters();
-    if (lidar.timeoutOccurred()) {
+    if (lidar.timeoutOccurred() || distanceMm == 65535) {
+        // Continuous mode failed or timed out.
+        // Clear latched interrupt register (0x0B = SYSTEM_INTERRUPT_CLEAR)
+        lidar.writeReg(0x0B, 0x01);
+        // Attempt single-shot measurement
+        distanceMm = lidar.readRangeSingleMillimeters();
+        if (lidar.timeoutOccurred() || distanceMm >= 8190) {
+            distanceMm = 0;
+        }
+        // Re-arm continuous mode for next cycle
+        lidar.writeReg(0x0B, 0x01);
+        lidar.startContinuous();
+    } else if (distanceMm >= 8190) {
+        // ST VL53L0X returns >= 8190 when out-of-range or signal fail
         distanceMm = 0;
     }
+    return distanceMm;
+}
+
+static bool readAndSendLidar(uint16_t packetAngle) {
+    uint16_t distanceMm = readLidarDistanceMm();
     sendLidarPacket(packetAngle, distanceMm);
     return !emergencyStop;
 }
@@ -154,6 +176,10 @@ void processLidarScan() {
     shouldMoveCm = false;
     shouldTurn = false;
 
+    // Ensure continuous mode is fresh and armed before scan
+    lidar.writeReg(0x0B, 0x01);
+    lidar.startContinuous();
+
     if (lidarContinuous) {
         sendLog("Continuous lidar started: " + String(lidarSweepDegrees, 1) +
                 " deg, " + String(lidarStepDistanceCm, 1) + " cm steps");
@@ -174,10 +200,7 @@ void processLidarScan() {
 
     for (uint16_t angle = 0; angle < 360 && !emergencyStop; angle += 5) {
         turnRobot(5.0);
-        uint16_t distanceMm = lidar.readRangeContinuousMillimeters();
-        if (lidar.timeoutOccurred()) {
-            distanceMm = 0;
-        }
+        uint16_t distanceMm = readLidarDistanceMm();
         sendLidarPacket(angle, distanceMm);
     }
 

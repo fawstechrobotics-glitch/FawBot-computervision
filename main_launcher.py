@@ -170,7 +170,7 @@ class FawBotLauncher(QMainWindow):
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
         self.log_output.setStyleSheet(
-            "background-color: #1e1e1e; color: #00ff00; font-family: monospace; font-size: 12px;"
+            "background-color: #1e1e1e; color: #00ff00; font-family: 'Menlo', monospace; font-size: 12px;"
         )
         log_layout.addWidget(self.log_output)
 
@@ -390,14 +390,28 @@ class FawBotLauncher(QMainWindow):
         self.log_output.moveCursor(QTextCursor.End)
 
     def closeEvent(self, event):
-        self.stop_script()
-        if self.fawbot_os_window:
-            self.fawbot_os_window.close()
+        self._clean_shutdown()
         event.accept()
+
+    def _clean_shutdown(self):
+        self.stop_script()
+        if getattr(self, "fawbot_os_window", None):
+            try:
+                self.fawbot_os_window.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
+    if hasattr(Qt, "AA_ShareOpenGLContexts"):
+        QApplication.setAttribute(Qt.AA_ShareOpenGLContexts, True)
+    if hasattr(Qt, "AA_EnableHighDpiScaling"):
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    if hasattr(Qt, "AA_UseHighDpiPixmaps"):
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+
     app = QApplication(sys.argv)
     window = FawBotLauncher()
+    app.aboutToQuit.connect(window._clean_shutdown)
     window.show()
     sys.exit(app.exec())

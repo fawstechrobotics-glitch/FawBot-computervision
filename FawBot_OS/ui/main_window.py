@@ -72,13 +72,13 @@ class MainWindow(QMainWindow):
         top_layout.addStretch()
 
         self.lbl_global_conn = QLabel(f"UDP: {settings.ROBOT_HOST}:{settings.UDP_PORT} (READY)")
-        self.lbl_global_conn.setStyleSheet("color: #00ffaa; font-family: monospace; font-weight: bold;")
+        self.lbl_global_conn.setStyleSheet("color: #00ffaa; font-family: 'Menlo', 'Courier New'; font-weight: bold;")
         top_layout.addWidget(self.lbl_global_conn)
 
         top_layout.addSpacing(20)
 
         self.lbl_global_pose = QLabel("Pose: X: -- | Y: -- | Heading: 0.0°")
-        self.lbl_global_pose.setStyleSheet("color: #ffcc00; font-family: monospace; font-weight: bold;")
+        self.lbl_global_pose.setStyleSheet("color: #ffcc00; font-family: 'Menlo', 'Courier New'; font-weight: bold;")
         top_layout.addWidget(self.lbl_global_pose)
 
         top_layout.addSpacing(20)
@@ -103,7 +103,9 @@ class MainWindow(QMainWindow):
         self.swarming_page = SwarmingPage(self.fleet)
         primary_spec = self.fleet.roster.get(self.fleet.primary_id)
         lidar_host = primary_spec.host if primary_spec else settings.ROBOT_HOST
-        self.lidar_page = LidarMappingPage(lidar_host, self.comm)
+        self.lidar_page = LidarMappingPage(
+            lidar_host, self.comm, controller=self.controller, state=self.state
+        )
 
         # Keep every configured robot visible on both maps. The primary robot
         # continues to drive the existing single-robot controls.
@@ -145,7 +147,6 @@ class MainWindow(QMainWindow):
     def _connect_header_telemetry(self):
         # Update connection status
         self.comm.connection_status_changed.connect(self._on_conn_changed)
-        self.comm.feedback_received.connect(self.lidar_page.handle_udp_message)
 
         # Update global coordinates
         self.state.pose_changed.connect(
@@ -164,10 +165,10 @@ class MainWindow(QMainWindow):
     def _on_conn_changed(self, connected: bool):
         if connected:
             self.lbl_global_conn.setText(f"UDP: {settings.ROBOT_HOST}:{settings.UDP_PORT} (ONLINE)")
-            self.lbl_global_conn.setStyleSheet("color: #00ffaa; font-family: monospace; font-weight: bold;")
+            self.lbl_global_conn.setStyleSheet("color: #00ffaa; font-family: 'Menlo', 'Courier New'; font-weight: bold;")
         else:
             self.lbl_global_conn.setText(f"UDP: {settings.ROBOT_HOST}:{settings.UDP_PORT} (OFFLINE)")
-            self.lbl_global_conn.setStyleSheet("color: #ff3366; font-family: monospace; font-weight: bold;")
+            self.lbl_global_conn.setStyleSheet("color: #ff3366; font-family: 'Menlo', 'Courier New'; font-weight: bold;")
 
     def _on_safety_alert(self):
         self.lbl_global_safety.setText("SAFETY: HALTED")

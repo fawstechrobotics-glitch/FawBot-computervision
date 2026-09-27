@@ -76,6 +76,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         <button id="btnUS" class="btn-blue btn-toggle" onclick="toggleSensor('us')">US: ENABLED</button>
         <button id="btnLidar" class="btn-blue btn-toggle" onclick="toggleLidar()">Start 360 Lidar</button>
         <div class="input-box"><label>Scan angle</label><input type="number" id="lidarAngle" value="180" step="5" min="5" max="360"></div>
+        <div class="input-box"><label>Lidar step (°)</label><input type="number" id="lidarStepDeg" value="5" step="0.5" min="0.5" max="30" onchange="updateConfig('lidar_step', this.value)"></div>
         <div class="input-box"><label>Forward step (cm)</label><input type="number" id="lidarDistance" value="10" min="0.1" step="0.1"></div>
         <button id="btnContinuousLidar" class="btn-blue btn-toggle" onclick="toggleContinuousLidar()">Start Continuous Lidar</button>
     </div>
@@ -214,6 +215,11 @@ void startWebPortal() {
             float val = r->getParam("val")->value().toFloat();
             if (param == "delay") speedDelayUs = (int)val;
             else if (param == "obs") obstacleThreshold = (int)val;
+            else if (param == "lidar_step") {
+                if (val > 0.0f && val <= 30.0f) {
+                    lidarStepAngleDegrees = val;
+                }
+            }
             sendLog("System: Updated " + param + " to " + String(val));
         }
         r->send(200);
@@ -342,17 +348,34 @@ void handleUDP() {
             float val = msg.substring(secondColon + 1).toFloat();
             if (param == "delay") speedDelayUs = (int)val;
             else if (param == "obs") obstacleThreshold = (int)val;
+            else if (param == "lidar_step") {
+                if (val > 0.0f && val <= 30.0f) {
+                    lidarStepAngleDegrees = val;
+                }
+            }
             sendLog("UDP Config: Updated " + param + " to " + String(val));
         }
         sendUDPFeedback("ACK:CFG");
     }
-    // 5. Continuous lidar scan: LIDAR:<sweep degrees>:<forward cm>
+    // 5. Continuous lidar scan: LIDAR:<sweep degrees>:<forward cm>:<x>:<y>:<heading>
     else if (msg.startsWith("LIDAR:")) {
         int firstColon = msg.indexOf(':');
         int secondColon = msg.indexOf(':', firstColon + 1);
         if (secondColon != -1) {
             float angle = msg.substring(firstColon + 1, secondColon).toFloat();
-            float distance = msg.substring(secondColon + 1).toFloat();
+            int thirdColon = msg.indexOf(':', secondColon + 1);
+            float distance = thirdColon == -1
+                ? msg.substring(secondColon + 1).toFloat()
+                : msg.substring(secondColon + 1, thirdColon).toFloat();
+            if (thirdColon != -1) {
+                int fourthColon = msg.indexOf(':', thirdColon + 1);
+                int fifthColon = fourthColon == -1 ? -1 : msg.indexOf(':', fourthColon + 1);
+                if (fifthColon != -1) {
+                    lidarPoseX = msg.substring(thirdColon + 1, fourthColon).toFloat();
+                    lidarPoseY = msg.substring(fourthColon + 1, fifthColon).toFloat();
+                    lidarPoseHeading = msg.substring(fifthColon + 1).toFloat();
+                }
+            }
             requestContinuousLidarScan(angle, distance);
             sendUDPFeedback("ACK:LIDAR");
         } else {

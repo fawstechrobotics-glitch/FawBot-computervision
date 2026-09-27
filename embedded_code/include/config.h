@@ -73,14 +73,19 @@
 #define LIDAR_SCL 22
 #endif
 
+#ifndef LIDAR_STEP_ANGLE_DEG
+#define LIDAR_STEP_ANGLE_DEG 1.0f
+#endif
+
 // --- MECHANICAL CONFIGURATION ---
 #define STEPS_PER_REV 4096.0
-#define WHEEL_DIAMETER_CM 5
-#define WHEEL_BASE_CM     10.2 
+#define WHEEL_DIAMETER_CM 5.6
+#define WHEEL_BASE_CM     10.5 
 #define WHEEL_CIRCUMFERENCE (3.14159 * WHEEL_DIAMETER_CM)
 
 // --- HARDCODED CALIBRATED STEPS PER CM ---
-#define STEPS_PER_CM 256.81f
+// #define STEPS_PER_CM 256.81f
+#define STEPS_PER_CM 225.0f
 
 // --- SHARED CONTROL VARIABLES ---
 extern int speedPercent;       
@@ -110,7 +115,11 @@ extern volatile bool lidarScanRequested;
 extern volatile bool lidarScanning;
 extern volatile bool lidarContinuous;
 extern volatile float lidarSweepDegrees;
+extern volatile float lidarStepAngleDegrees;
 extern volatile float lidarStepDistanceCm;
+extern volatile float lidarPoseX;
+extern volatile float lidarPoseY;
+extern volatile float lidarPoseHeading;
 
 extern AsyncWebServer server;
 extern AsyncEventSource events;
@@ -135,6 +144,7 @@ void processLidarScan();
 void startWebPortal();
 void handleUDP();
 void serviceEmergencyStop();
+void sendUDPFeedback(String message);
 void sendLog(String msg);
 
 #endif

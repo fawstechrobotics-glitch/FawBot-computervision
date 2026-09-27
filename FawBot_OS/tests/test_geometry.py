@@ -56,7 +56,7 @@ class TestGeometry(unittest.TestCase):
         self.assertAlmostEqual(min(ys), 7.0)
 
     def test_boundary_containment(self):
-        boundary = Boundary(width_cm=100.0, height_cm=100.0)
+        boundary = Boundary(width_cm=100.0, height_cm=100.0, enabled=True)
         # Robot well inside
         fp_inside = compute_robot_footprint(50.0, 50.0, 0.0, 12.0, 9.0, margin_cm=2.0)
         self.assertTrue(is_footprint_within_boundary(fp_inside, boundary))

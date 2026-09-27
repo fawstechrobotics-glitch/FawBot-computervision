@@ -210,12 +210,15 @@ class RobotController(QObject):
             while delta > 180.0: delta -= 360.0
             while delta < -180.0: delta += 360.0
             curr_angle = normalize_angle_deg(self.start_angle + delta * factor)
-            self.state.set_pose(self.state.x, self.state.y, curr_angle, set_initial_if_unset=False)
+            curr_x = self.state.x if (self.state and self.state.x is not None) else 0.0
+            curr_y = self.state.y if (self.state and self.state.y is not None) else 0.0
+            self.state.set_pose(curr_x, curr_y, curr_angle, set_initial_if_unset=False)
 
         elif self.anim_mode == "MOVE":
             curr_x = self.start_pos[0] + (self.end_pos[0] - self.start_pos[0]) * factor
             curr_y = self.start_pos[1] + (self.end_pos[1] - self.start_pos[1]) * factor
-            self.state.set_pose(curr_x, curr_y, self.state.heading, set_initial_if_unset=False)
+            curr_h = self.state.heading if (self.state and self.state.heading is not None) else 0.0
+            self.state.set_pose(curr_x, curr_y, curr_h, set_initial_if_unset=False)
             self.state.append_trail_point((curr_x, curr_y))
 
     def _handle_feedback(self, msg: str):

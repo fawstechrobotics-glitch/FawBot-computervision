@@ -20,7 +20,7 @@ QMainWindow {
 QWidget {
     background-color: #1a1a1a;
     color: #dcdcdc;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+    font-family: 'Helvetica Neue', Helvetica, Arial;
     font-size: 11px;
 }
 QTabWidget::pane {
@@ -147,12 +147,12 @@ QListWidget::item:selected {
 }
 #telemetryText {
     color: #00ffaa;
-    font-family: monospace;
+    font-family: 'Menlo', 'Courier New';
     font-size: 12px;
 }
 #mouseCoordText {
     color: #ffcc00;
-    font-family: monospace;
+    font-family: 'Menlo', 'Courier New';
     font-size: 12px;
     font-weight: bold;
 }
