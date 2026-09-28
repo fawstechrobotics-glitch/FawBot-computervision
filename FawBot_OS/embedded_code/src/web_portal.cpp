@@ -186,8 +186,16 @@ void startWebPortal() {
             isManualMoving = true;
             if (cmd == "F") moveDirection = -1.0;
             else if (cmd == "B") moveDirection = 1.0;
-            else if (cmd == "L") moveDirection = -2.0;  
-            else if (cmd == "R") moveDirection = 2.0; 
+            else if (cmd == "L") {
+                moveDirection = -2.0;
+                events.send("CCW", "rotation_dir", millis());
+                sendUDPFeedback("ROTATION_DIR:CCW");
+            }
+            else if (cmd == "R") {
+                moveDirection = 2.0;
+                events.send("CW", "rotation_dir", millis());
+                sendUDPFeedback("ROTATION_DIR:CW");
+            }
         }
         r->send(200);
     });
@@ -204,7 +212,14 @@ void startWebPortal() {
     });
 
     server.on("/turn", HTTP_GET, [](AsyncWebServerRequest *r){
+        if (lidarScanning || lidarScanRequested || (millis() - lastLidarSweepCompletedTime < 1500)) {
+            r->send(200, "text/plain", "turn acknowledged during lidar scan");
+            return;
+        }
         targetDegrees = r->getParam("deg")->value().toFloat();
+        const char* rotDir = (targetDegrees < 0) ? "CW" : "CCW";
+        events.send(rotDir, "rotation_dir", millis());
+        sendUDPFeedback("ROTATION_DIR:" + String(rotDir));
         shouldTurn = true;
         r->send(200);
     });
@@ -246,7 +261,9 @@ void startWebPortal() {
             requestContinuousLidarScan(angle, distance);
             r->send(200, "text/plain", "continuous scan started");
         } else if (command == "start" && !lidarScanning) {
-            requestLidarScan();
+            float angle = r->hasParam("angle") ? r->getParam("angle")->value().toFloat() : lidarSweepDegrees;
+            shouldTurn = false;
+            requestLidarScan(angle);
             r->send(200, "text/plain", "started");
         } else if (command == "stop") {
             stopLidarScan();
@@ -288,8 +305,16 @@ void handleUDP() {
 
     // 1. Precise Turn Control with Real-Time Feedback Confirmation
     if (msg.startsWith("TURN:")) {
+        if (lidarScanning || lidarScanRequested || (millis() - lastLidarSweepCompletedTime < 1500)) {
+            sendLog("UDP Command: TURN acknowledged during active LiDAR sweep");
+            sendUDPFeedback("ACK:TURN");
+            return;
+        }
         float deg = msg.substring(5).toFloat();
-        sendLog("UDP Command: Turning " + String(deg) + " deg");
+        const char* rotDir = (deg < 0) ? "CW" : "CCW";
+        sendLog("UDP Command: Turning " + String(deg) + " deg (" + String(rotDir) + ")");
+        sendUDPFeedback("ROTATION_DIR:" + String(rotDir));
+        events.send(rotDir, "rotation_dir", millis());
         
         turnRobot(deg); // Blocking rotation
         
@@ -298,6 +323,8 @@ void handleUDP() {
         } else if (safetyHalt) {
             sendUDPFeedback("ALERT:SAFETY_HALT");
         } else {
+            sendUDPFeedback("ROTATION_DIR:CENTER");
+            events.send("CENTER", "rotation_dir", millis());
             sendUDPFeedback("COMPLETED:TURN:" + String(deg, 1));
         }
     }
@@ -357,7 +384,7 @@ void handleUDP() {
         }
         sendUDPFeedback("ACK:CFG");
     }
-    // 5. Continuous lidar scan: LIDAR:<sweep degrees>:<forward cm>:<x>:<y>:<heading>
+    // 5. Continuous lidar scan or single sweep: LIDAR:<sweep degrees>:<forward cm>:<x>:<y>:<heading>
     else if (msg.startsWith("LIDAR:")) {
         int firstColon = msg.indexOf(':');
         int secondColon = msg.indexOf(':', firstColon + 1);
@@ -376,11 +403,24 @@ void handleUDP() {
                     lidarPoseHeading = msg.substring(fifthColon + 1).toFloat();
                 }
             }
-            requestContinuousLidarScan(angle, distance);
+            shouldTurn = false;
+            if (distance <= 0.0f) {
+                requestLidarScan(angle);
+            } else {
+                requestContinuousLidarScan(angle, distance);
+            }
             sendUDPFeedback("ACK:LIDAR");
         } else {
             sendUDPFeedback("ERROR:LIDAR_FORMAT");
         }
+    }
+    // 5b. Single sweep angle command: SWEEP:<sweep degrees>
+    else if (msg.startsWith("SWEEP:")) {
+        float deg = msg.substring(6).toFloat();
+        if (deg <= 0.0f) deg = lidarSweepDegrees;
+        shouldTurn = false;
+        requestLidarScan(deg);
+        sendUDPFeedback("ACK:SWEEP");
     }
     // 5. Emergency Stop
     else if (msg == "STOP") {
@@ -403,8 +443,16 @@ void handleUDP() {
             isManualMoving = true;
             if (cmd == 'F') moveDirection = -1.0;
             else if (cmd == 'B') moveDirection = 1.0;
-            else if (cmd == 'L') moveDirection = -2.0;
-            else if (cmd == 'R') moveDirection = 2.0;
+            else if (cmd == 'L') {
+                moveDirection = -2.0;
+                sendUDPFeedback("ROTATION_DIR:CCW");
+                events.send("CCW", "rotation_dir", millis());
+            }
+            else if (cmd == 'R') {
+                moveDirection = 2.0;
+                sendUDPFeedback("ROTATION_DIR:CW");
+                events.send("CW", "rotation_dir", millis());
+            }
         }
     }
 }
@@ -429,6 +477,8 @@ void serviceEmergencyStop() {
             shouldTurn = false;
             stopMotors();
             sendUDPFeedback("ALERT:EMERGENCY_STOP");
+        } else if (msg.startsWith("TURN:")) {
+            sendUDPFeedback("ACK:TURN");
         }
     }
 }

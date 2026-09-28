@@ -3,7 +3,7 @@
 VL53L0X lidar;
 bool lidarReady = false;
 
-static void sendLidarPacket(uint16_t angleDegrees, uint16_t distanceMm) {
+static void sendLidarPacket(uint16_t angleDegrees, uint16_t distanceMm, const char* dirStr = "CENTER") {
     uint16_t angleQ6 = (uint16_t)(angleDegrees * 64U);
     uint16_t distanceQ2 = (uint16_t)min((uint32_t)distanceMm * 4U, 65535U);
     uint8_t packet[5] = {
@@ -17,8 +17,9 @@ static void sendLidarPacket(uint16_t angleDegrees, uint16_t distanceMm) {
     char packetHex[11];
     snprintf(packetHex, sizeof(packetHex), "%02X%02X%02X%02X%02X",
              packet[0], packet[1], packet[2], packet[3], packet[4]);
-    events.send(packetHex, "lidar_packet", millis());
-    sendUDPFeedback("LIDAR_PACKET:" + String(packetHex));
+    String fullPacket = String(packetHex) + ":" + String(dirStr);
+    events.send(fullPacket.c_str(), "lidar_packet", millis());
+    sendUDPFeedback("LIDAR_PACKET:" + fullPacket);
 }
 
 void initSensors() {
@@ -68,8 +69,11 @@ void updateSensors() {
     }
 }
 
-void requestLidarScan() {
+void requestLidarScan(float sweepDegrees) {
     if (lidarReady && !lidarScanning) {
+        if (sweepDegrees > 0.0f && sweepDegrees <= 360.0f) {
+            lidarSweepDegrees = sweepDegrees;
+        }
         lidarContinuous = false;
         lidarScanRequested = true;
     }
@@ -115,38 +119,128 @@ static uint16_t readLidarDistanceMm() {
     return distanceMm;
 }
 
-static bool readAndSendLidar(uint16_t packetAngle) {
+static bool readAndSendLidar(float relAngleDeg, const char* dirStr, uint16_t packetAngle) {
     uint16_t distanceMm = readLidarDistanceMm();
-    sendLidarPacket(packetAngle, distanceMm);
+    float distCm = distanceMm / 10.0f;
+    String ptMsg = "LIDAR_POINT:" + String(dirStr) + ":" + String(relAngleDeg, 1) + ":" + String(distCm, 1);
+    sendUDPFeedback(ptMsg);
+    events.send(ptMsg.c_str(), "lidar_point", millis());
+    sendLidarPacket(packetAngle, distanceMm, dirStr);
+    return !emergencyStop;
+}
+
+static bool executeLidarSweep(float sweepDegrees) {
+    const float lidarStep = (lidarStepAngleDegrees > 0.0f) ? lidarStepAngleDegrees : LIDAR_STEP_ANGLE_DEG;
+
+    sendUDPFeedback("SWEEP_START:" + String(sweepDegrees, 1));
+    events.send(String(sweepDegrees, 1).c_str(), "sweep_start", millis());
+
+    if (sweepDegrees >= 350.0f) {
+        // Full 360-degree rotation: turn Anti-Clockwise (CCW) in a full circle
+        sendUDPFeedback("SWEEP_DIR:CCW");
+        events.send("CCW", "sweep_dir", millis());
+        sendUDPFeedback("ROTATION_DIR:CCW");
+        events.send("CCW", "rotation_dir", millis());
+        const uint16_t totalSteps = (uint16_t)(360.0f / lidarStep);
+        for (uint16_t sample = 0; sample < totalSteps; sample++) {
+            turnRobot(lidarStep); // Anti-Clockwise / Left
+            float currentRelAngle = (float)(sample + 1) * lidarStep;
+            if (!readAndSendLidar(currentRelAngle, "CCW", (uint16_t)currentRelAngle)) {
+                lastLidarSweepCompletedTime = millis();
+                sendUDPFeedback("SWEEP_DIR:DONE");
+                events.send("DONE", "sweep_dir", millis());
+                sendUDPFeedback("ROTATION_DIR:CENTER");
+                events.send("CENTER", "rotation_dir", millis());
+                return false;
+            }
+        }
+        lastLidarSweepCompletedTime = millis();
+        sendUDPFeedback("SWEEP_DIR:DONE");
+        events.send("DONE", "sweep_dir", millis());
+        sendUDPFeedback("ROTATION_DIR:CENTER");
+        events.send("CENTER", "rotation_dir", millis());
+        return !emergencyStop;
+    }
+
+    const float halfSweep = sweepDegrees / 2.0f;
+    const uint16_t sampleCount = (uint16_t)(halfSweep / lidarStep);
+    const float actualTurn = sampleCount * lidarStep;
+    const uint16_t centerPacketAngle = (uint16_t)(halfSweep);
+
+    // Phase 1: Clockwise (CW) rotation to the right
+    sendUDPFeedback("SWEEP_DIR:CW");
+    events.send("CW", "sweep_dir", millis());
+    sendUDPFeedback("ROTATION_DIR:CW");
+    events.send("CW", "rotation_dir", millis());
+    for (uint16_t sample = 0; sample < sampleCount; sample++) {
+        turnRobot(-lidarStep); // Clockwise / Right
+        float currentRelAngle = -(float)(sample + 1) * lidarStep;
+        if (!readAndSendLidar(currentRelAngle, "CW", (uint16_t)(sample * lidarStep))) {
+            turnRobot((sample + 1) * lidarStep);
+            lastLidarSweepCompletedTime = millis();
+            sendUDPFeedback("SWEEP_DIR:DONE");
+            events.send("DONE", "sweep_dir", millis());
+            sendUDPFeedback("ROTATION_DIR:CENTER");
+            events.send("CENTER", "rotation_dir", millis());
+            return false;
+        }
+    }
+
+    // Return to Center (0 deg relative) by turning Anti-Clockwise (CCW)
+    sendUDPFeedback("ROTATION_DIR:CCW");
+    events.send("CCW", "rotation_dir", millis());
+    turnRobot(actualTurn);
+
+    sendUDPFeedback("SWEEP_DIR:CENTER");
+    events.send("CENTER", "sweep_dir", millis());
+    sendUDPFeedback("ROTATION_DIR:CENTER");
+    events.send("CENTER", "rotation_dir", millis());
+    if (!readAndSendLidar(0.0f, "CENTER", centerPacketAngle)) {
+        lastLidarSweepCompletedTime = millis();
+        sendUDPFeedback("SWEEP_DIR:DONE");
+        events.send("DONE", "sweep_dir", millis());
+        sendUDPFeedback("ROTATION_DIR:CENTER");
+        events.send("CENTER", "rotation_dir", millis());
+        return false;
+    }
+
+    // Phase 2: Anti-Clockwise (CCW) rotation to the left
+    sendUDPFeedback("SWEEP_DIR:CCW");
+    events.send("CCW", "sweep_dir", millis());
+    sendUDPFeedback("ROTATION_DIR:CCW");
+    events.send("CCW", "rotation_dir", millis());
+    for (uint16_t sample = 0; sample < sampleCount; sample++) {
+        turnRobot(lidarStep); // Anti-Clockwise / Left
+        float currentRelAngle = (float)(sample + 1) * lidarStep;
+        if (!readAndSendLidar(currentRelAngle, "CCW", centerPacketAngle + (uint16_t)((sample + 1) * lidarStep))) {
+            turnRobot(-(sample + 1) * lidarStep);
+            lastLidarSweepCompletedTime = millis();
+            sendUDPFeedback("SWEEP_DIR:DONE");
+            events.send("DONE", "sweep_dir", millis());
+            sendUDPFeedback("ROTATION_DIR:CENTER");
+            events.send("CENTER", "rotation_dir", millis());
+            return false;
+        }
+    }
+
+    // Return to Center (0 deg relative) by turning Clockwise (CW)
+    sendUDPFeedback("ROTATION_DIR:CW");
+    events.send("CW", "rotation_dir", millis());
+    turnRobot(-actualTurn);
+
+    lastLidarSweepCompletedTime = millis();
+    sendUDPFeedback("SWEEP_DIR:DONE");
+    events.send("DONE", "sweep_dir", millis());
+    sendUDPFeedback("ROTATION_DIR:CENTER");
+    events.send("CENTER", "rotation_dir", millis());
     return !emergencyStop;
 }
 
 static bool processContinuousLidarCycle() {
-    const float lidarStep = (lidarStepAngleDegrees > 0.0f) ? lidarStepAngleDegrees : LIDAR_STEP_ANGLE_DEG;
-    const float halfSweep = lidarSweepDegrees / 2.0f;
-    const uint16_t sampleCount = (uint16_t)(halfSweep / lidarStep);
-    const uint16_t centerPacketAngle = (uint16_t)(halfSweep);
-
-    for (uint16_t sample = 0; sample < sampleCount; sample++) {
-        turnRobot(-lidarStep);
-        if (!readAndSendLidar((uint16_t)(sample * lidarStep))) {
-            return false;
-        }
-    }
-
-    turnRobot(halfSweep);
-    if (!readAndSendLidar(centerPacketAngle)) {
+    if (!executeLidarSweep(lidarSweepDegrees)) {
         return false;
     }
 
-    for (uint16_t sample = 0; sample < sampleCount; sample++) {
-        turnRobot(lidarStep);
-        if (!readAndSendLidar(centerPacketAngle + (uint16_t)((sample + 1) * lidarStep))) {
-            return false;
-        }
-    }
-
-    turnRobot(-halfSweep);
     moveRobotCm(lidarStepDistanceCm, 1.0);
     if (emergencyStop || safetyHalt) {
         return false;
@@ -196,13 +290,8 @@ void processLidarScan() {
         return;
     }
 
-    sendLog("Lidar scan started: 360 degrees");
-
-    for (uint16_t angle = 0; angle < 360 && !emergencyStop; angle += 5) {
-        turnRobot(5.0);
-        uint16_t distanceMm = readLidarDistanceMm();
-        sendLidarPacket(angle, distanceMm);
-    }
+    sendLog("Lidar sweep scan started: " + String(lidarSweepDegrees, 1) + " degrees");
+    executeLidarSweep(lidarSweepDegrees);
 
     stopMotors();
     lidarScanning = false;

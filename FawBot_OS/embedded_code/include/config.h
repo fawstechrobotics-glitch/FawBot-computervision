@@ -120,6 +120,7 @@ extern volatile float lidarStepDistanceCm;
 extern volatile float lidarPoseX;
 extern volatile float lidarPoseY;
 extern volatile float lidarPoseHeading;
+extern volatile unsigned long lastLidarSweepCompletedTime;
 
 extern AsyncWebServer server;
 extern AsyncEventSource events;
@@ -136,7 +137,7 @@ void moveManualStep(int dirL, int dirR);
 
 void initSensors();
 void updateSensors();
-void requestLidarScan();
+void requestLidarScan(float sweepDegrees = 180.0f);
 void requestContinuousLidarScan(float sweepDegrees, float stepDistanceCm);
 void stopLidarScan();
 void processLidarScan();

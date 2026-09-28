@@ -27,12 +27,13 @@ bool ultrasonicEnabled = true;
 volatile bool lidarScanRequested = false;
 volatile bool lidarScanning = false;
 volatile bool lidarContinuous = false;
-volatile float lidarSweepDegrees = 360.0;
+volatile float lidarSweepDegrees = 180.0;
 volatile float lidarStepAngleDegrees = LIDAR_STEP_ANGLE_DEG;
 volatile float lidarStepDistanceCm = 0.0;
 volatile float lidarPoseX = 0.0;
 volatile float lidarPoseY = 0.0;
 volatile float lidarPoseHeading = 0.0;
+volatile unsigned long lastLidarSweepCompletedTime = 0;
 
 AsyncWebServer server(80);
 AsyncEventSource events("/events");
@@ -92,7 +93,12 @@ void loop() {
             moveRobotCm(targetDistanceCm, moveDirection);
         } else if (shouldTurn) {
             shouldTurn = false;
+            const char* rotDir = (targetDegrees < 0) ? "CW" : "CCW";
+            sendUDPFeedback("ROTATION_DIR:" + String(rotDir));
+            events.send(rotDir, "rotation_dir", millis());
             turnRobot(targetDegrees);
+            sendUDPFeedback("ROTATION_DIR:CENTER");
+            events.send("CENTER", "rotation_dir", millis());
         } else if (isManualMoving) {
             if (moveDirection == -1.0)      moveManualStep(-1, -1); // Forward
             else if (moveDirection == 1.0)  moveManualStep(1, 1);   // Backward
